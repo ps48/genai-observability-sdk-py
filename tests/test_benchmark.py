@@ -9,6 +9,9 @@
 
 """Tests for opensearch_genai_observability_sdk_py.benchmark."""
 
+import importlib
+import warnings
+
 import pytest
 
 from opensearch_genai_observability_sdk_py.benchmark import (
@@ -39,7 +42,19 @@ def _get_root_span(exporter, benchmark_name):
 
 
 def _get_case_spans(exporter):
-    return [s for s in exporter.get_finished_spans() if s.name == "test_case"]
+    return [s for s in exporter.get_finished_spans() if s.name.startswith("test_case ")]
+
+
+_score_mod = importlib.import_module("opensearch_genai_observability_sdk_py.score")
+
+
+@pytest.fixture(autouse=True)
+def _reset_carrier(monkeypatch):
+    monkeypatch.delenv("OPENSEARCH_GENAI_EVAL_CARRIER", raising=False)
+    monkeypatch.setattr(_score_mod, "_span_carrier_warned", False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +127,8 @@ class TestBenchmarkRootSpan:
         root = _get_root_span(exporter, "my-bench")
         assert root.attributes["test.suite.name"] == "my-bench"
         assert root.attributes["test.suite.run.id"].startswith("run_")
-        assert root.attributes["gen_ai.operation.name"] == "evaluation"
+        # Benchmark spans are not evaluation results (deprecated span carrier).
+        assert "gen_ai.operation.name" not in root.attributes
 
     def test_root_span_success_status(self, exporter):
         with Benchmark(name="ok-bench") as b:
@@ -227,9 +243,34 @@ class TestBenchmarkLog:
                 metadata={"gen_ai.operation.name": "oops", "model": "gpt-4"},
             )
         case = _get_case_spans(exporter)[0]
-        # Reserved key should not overwrite SDK attribute
-        assert case.attributes["gen_ai.operation.name"] == "evaluation"
+        # Reserved key is filtered out
+        assert "gen_ai.operation.name" not in case.attributes
         assert case.attributes["model"] == "gpt-4"
+
+    def test_case_span_name_uses_case_name(self, exporter):
+        with Benchmark(name="name-test") as b:
+            b.log(input="q1", case_name="greeting")
+        assert _get_case_spans(exporter)[0].name == "test_case greeting"
+
+    def test_case_span_name_falls_back_to_case_id(self, exporter):
+        with Benchmark(name="name-test") as b:
+            b.log(input="q1", case_id="c-7")
+        assert _get_case_spans(exporter)[0].name == "test_case c-7"
+
+    def test_error_recorded_under_opensearch_namespace(self, exporter):
+        with Benchmark(name="err-ns") as b:
+            b.log(input="q1", error="boom")
+        case = _get_case_spans(exporter)[0]
+        assert case.attributes["opensearch.test_case.error"] == "boom"
+        assert "test.case.error" not in case.attributes
+
+    def test_suite_and_case_span_kinds(self, exporter):
+        from opentelemetry.trace import SpanKind
+
+        with Benchmark(name="kind-test") as b:
+            b.log(input="q1")
+        assert _get_root_span(exporter, "kind-test").kind == SpanKind.INTERNAL
+        assert _get_case_spans(exporter)[0].kind == SpanKind.INTERNAL
 
     def test_log_after_close_raises(self):
         b = Benchmark(name="closed")
@@ -250,27 +291,65 @@ class TestBenchmarkLog:
 
 
 class TestBenchmarkScoreEvents:
-    def test_score_events_emitted(self, exporter):
+    def test_one_log_event_per_score(self, exporter, eval_events):
         with Benchmark(name="evt-test") as b:
             b.log(input="q1", scores={"accuracy": 0.9, "relevance": 0.8})
+        names = sorted(r.log_record.attributes["gen_ai.evaluation.name"] for r in eval_events())
+        assert names == ["accuracy", "relevance"]
+        # No deprecated span events by default
         case = _get_case_spans(exporter)[0]
-        events = [e for e in case.events if e.name == "gen_ai.evaluation.result"]
-        assert len(events) == 2
+        assert [e for e in case.events if e.name == "gen_ai.evaluation.result"] == []
 
-    def test_score_event_attributes(self, exporter):
-        with Benchmark(name="evt-attr") as b:
+    def test_event_parented_to_case_span(self, exporter, eval_events):
+        with Benchmark(name="evt-parent") as b:
             b.log(input="q1", scores={"accuracy": 0.95})
         case = _get_case_spans(exporter)[0]
-        event = case.events[0]
-        assert event.attributes["gen_ai.evaluation.name"] == "accuracy"
-        assert event.attributes["gen_ai.evaluation.score.value"] == 0.95
+        lr = eval_events()[0].log_record
+        assert lr.trace_id == case.context.trace_id
+        assert lr.span_id == case.context.span_id
+        assert lr.attributes["gen_ai.evaluation.score.value"] == 0.95
+        assert lr.attributes["opensearch.evaluation.level"] == "span"
 
-    def test_no_scores_no_events(self, exporter):
+    def test_grouping_attributes_copied(self, eval_events):
+        with Benchmark(name="evt-group") as b:
+            b.log(input="q1", case_id="c1", case_name="greeting", scores={"accuracy": 1.0})
+        a = eval_events()[0].log_record.attributes
+        assert a["test.suite.name"] == "evt-group"
+        assert a["test.suite.run.id"] == b.run_id
+        assert a["test.case.id"] == "c1"
+        assert a["test.case.name"] == "greeting"
+        # Case content never goes on the event
+        assert not [k for k in a if k.startswith("opensearch.test_case.")]
+
+    def test_event_parented_to_linked_agent_span(self, eval_events):
+        with Benchmark(name="evt-link") as b:
+            b.log(input="q1", scores={"accuracy": 1.0}, trace_id=TRACE_ID, span_id=SPAN_ID)
+        lr = eval_events()[0].log_record
+        assert format(lr.trace_id, "032x") == TRACE_ID
+        assert format(lr.span_id, "016x") == SPAN_ID
+
+    def test_no_scores_no_events(self, eval_events):
         with Benchmark(name="no-score") as b:
             b.log(input="q1")
+        assert eval_events() == []
+
+    def test_span_carrier_env(self, monkeypatch, exporter, eval_events):
+        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "span")
+        with Benchmark(name="evt-span") as b:
+            b.log(input="q1", scores={"accuracy": 0.9})
         case = _get_case_spans(exporter)[0]
         events = [e for e in case.events if e.name == "gen_ai.evaluation.result"]
-        assert len(events) == 0
+        assert len(events) == 1
+        assert events[0].attributes["gen_ai.evaluation.score.value"] == 0.9
+        assert eval_events() == []
+
+    def test_both_carrier_env(self, monkeypatch, exporter, eval_events):
+        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "both")
+        with Benchmark(name="evt-both") as b:
+            b.log(input="q1", scores={"accuracy": 0.9})
+        case = _get_case_spans(exporter)[0]
+        assert len([e for e in case.events if e.name == "gen_ai.evaluation.result"]) == 1
+        assert len(eval_events()) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -283,31 +362,34 @@ class TestBenchmarkRecordIO:
         with Benchmark(name="no-io") as b:
             b.log(input="secret", output="answer", expected="truth")
         case = _get_case_spans(exporter)[0]
+        assert not [k for k in case.attributes if k.startswith("opensearch.test_case.")]
         assert "test.case.input" not in case.attributes
-        assert "test.case.output" not in case.attributes
-        assert "test.case.expected" not in case.attributes
 
     def test_record_io_true(self, exporter):
         with Benchmark(name="with-io", record_io=True) as b:
             b.log(input="question", output="answer", expected="truth")
         case = _get_case_spans(exporter)[0]
-        assert case.attributes["test.case.input"] == '"question"'
-        assert case.attributes["test.case.output"] == '"answer"'
-        assert case.attributes["test.case.expected"] == '"truth"'
+        assert case.attributes["opensearch.test_case.input"] == '"question"'
+        assert case.attributes["opensearch.test_case.output"] == '"answer"'
+        assert case.attributes["opensearch.test_case.expected"] == '"truth"'
+        # Invented test.* names are gone
+        assert "test.case.input" not in case.attributes
+        assert "test.case.output" not in case.attributes
+        assert "test.case.expected" not in case.attributes
 
     def test_record_io_dict_input(self, exporter):
         with Benchmark(name="dict-io", record_io=True) as b:
             b.log(input={"q": "hello"}, output="world")
         case = _get_case_spans(exporter)[0]
-        assert '"q"' in case.attributes["test.case.input"]
+        assert '"q"' in case.attributes["opensearch.test_case.input"]
 
     def test_record_io_truncation_marker(self, exporter):
         long_input = "x" * 20_000
         with Benchmark(name="trunc-io", record_io=True) as b:
             b.log(input=long_input, output="short")
         case = _get_case_spans(exporter)[0]
-        assert case.attributes["test.case.input"].endswith("...[truncated]")
-        assert len(case.attributes["test.case.input"]) <= 10_000
+        assert case.attributes["opensearch.test_case.input"].endswith("...[truncated]")
+        assert len(case.attributes["opensearch.test_case.input"]) <= 10_000
 
 
 # ---------------------------------------------------------------------------
@@ -516,9 +598,9 @@ class TestEvaluate:
 
         case_spans = _get_case_spans(exporter)
         case = case_spans[0]
-        assert case.attributes["test.case.input"] == '"question"'
-        assert case.attributes["test.case.expected"] == '"answer"'
-        assert '"answer: question"' in case.attributes["test.case.output"]
+        assert case.attributes["opensearch.test_case.input"] == '"question"'
+        assert case.attributes["opensearch.test_case.expected"] == '"answer"'
+        assert '"answer: question"' in case.attributes["opensearch.test_case.output"]
 
     def test_evaluate_case_id_from_data(self, exporter):
         evaluate(
@@ -548,7 +630,7 @@ class TestEvaluate:
 
         spans = exporter.get_finished_spans()
         agent_span = next(s for s in spans if s.name == "my_agent")
-        case_span = next(s for s in spans if s.name == "test_case")
+        case_span = next(s for s in spans if s.name.startswith("test_case "))
 
         # Agent span should be a child of the case span
         assert agent_span.parent is not None
@@ -582,6 +664,54 @@ class TestEvaluate:
         assert result.cases[0].status == "fail"
         assert result.cases[0].scorer_errors is not None
         assert any("scorer broke" in e for e in result.cases[0].scorer_errors)
+
+    def test_evaluate_emits_events_with_label_and_explanation(self, exporter, eval_events):
+        def judge(input_val, output, expected):
+            return EvalScore(name="relevance", value=0.7, label="relevant", explanation="ok")
+
+        evaluate(
+            name="evt-eval",
+            task=lambda x: x,
+            data=[{"input": "q1", "case_id": "c1", "case_name": "first"}],
+            scores=[judge],
+        )
+        case = _get_case_spans(exporter)[0]
+        rec = eval_events()[0]
+        lr = rec.log_record
+        assert lr.span_id == case.context.span_id
+        assert lr.attributes["gen_ai.evaluation.name"] == "relevance"
+        assert lr.attributes["gen_ai.evaluation.score.label"] == "relevant"
+        assert lr.attributes["gen_ai.evaluation.explanation"] == "ok"
+        assert lr.attributes["test.suite.name"] == "evt-eval"
+        assert lr.attributes["test.case.id"] == "c1"
+        assert lr.attributes["test.case.name"] == "first"
+        assert lr.attributes["opensearch.evaluation.evaluator.name"] == "judge"
+        assert rec.instrumentation_scope.name == "judge"
+
+    def test_evaluate_scorer_error_emits_error_event(self, eval_events):
+        def bad_scorer(input_val, output, expected):
+            raise RuntimeError("scorer broke")
+
+        evaluate(name="err-evt", task=lambda x: x, data=[{"input": "q1"}], scores=[bad_scorer])
+        a = eval_events()[0].log_record.attributes
+        assert a["gen_ai.evaluation.name"] == "bad_scorer"
+        assert a["error.type"] == "RuntimeError"
+        assert "gen_ai.evaluation.score.value" not in a
+
+    def test_evaluate_suite_and_case_structure(self, exporter):
+        evaluate(
+            name="struct-eval",
+            task=lambda x: x,
+            data=[{"input": "q1", "case_name": "one"}],
+            scores=[lambda i, o, e: 1.0],
+        )
+        root = _get_root_span(exporter, "struct-eval")
+        case = _get_case_spans(exporter)[0]
+        assert case.name == "test_case one"
+        assert case.parent.span_id == root.context.span_id
+        assert root.attributes["test.suite.run.status"] == "success"
+        assert case.attributes["test.case.result.status"] == "pass"
+        assert "gen_ai.operation.name" not in case.attributes
 
     def test_evaluate_accepts_generator(self, exporter):
         """data can be a generator (single-pass iterable)."""

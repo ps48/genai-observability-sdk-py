@@ -452,6 +452,28 @@ class TestFindEvaluatedTraceIds:
     def test_empty_input(self, retriever):
         assert retriever.find_evaluated_trace_ids([]) == set()
 
+    def test_event_results_from_evaluation_index(self, retriever):
+        retriever._mock_client.search.side_effect = [
+            {
+                "aggregations": {
+                    "by_trace": {"buckets": [{"key": "t1"}]},
+                    "by_target": {"buckets": [{"key": "t2"}, {"key": "other"}]},
+                }
+            },
+            {"aggregations": {"evaluated": {"buckets": []}}},
+        ]
+        assert retriever.find_evaluated_trace_ids(["t1", "t2", "t3"]) == {"t1", "t2"}
+        first = retriever._mock_client.search.call_args_list[0]
+        assert first.kwargs["index"] == "otel-v1-genai-evaluation*"
+        assert first.kwargs["ignore_unavailable"] is True
+
+    def test_evaluation_index_failure_falls_back_to_spans(self, retriever):
+        retriever._mock_client.search.side_effect = [
+            RuntimeError("index_not_found"),
+            {"aggregations": {"evaluated": {"buckets": [{"key": "t3"}]}}},
+        ]
+        assert retriever.find_evaluated_trace_ids(["t1", "t3"]) == {"t3"}
+
     def test_none_evaluated(self, retriever):
         retriever._mock_client.search.return_value = {
             "aggregations": {"evaluated": {"buckets": []}}

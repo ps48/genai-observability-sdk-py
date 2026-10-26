@@ -10,8 +10,10 @@
 """Benchmark tracking for GenAI evaluation results.
 
 Upload evaluation results from any harness (RAGAS, DeepEval, pytest, custom)
-as OTel spans with ``test.*`` attributes and ``gen_ai.evaluation.result``
-events. Results flow via OTLP to OpenSearch for analysis and comparison.
+as OTel ``test_suite_run`` / ``test_case`` spans with ``test.*`` attributes,
+plus one ``gen_ai.evaluation.result`` log event per score. Results flow via
+OTLP to OpenSearch for analysis and comparison (spans to
+``otel-v1-apm-span-*``, evaluation events to ``otel-v1-genai-evaluation``).
 
 Two modes of use:
 
@@ -30,13 +32,25 @@ Two modes of use:
         scores=[accuracy_scorer],
     )
 
-OTel conventions:
+Telemetry shape::
 
-- ``test.suite.name``, ``test.suite.run.id`` — benchmark identity
-  (https://github.com/open-telemetry/semantic-conventions/issues/3398)
-- ``test.case.id``, ``test.case.name``, ``test.case.result.status`` — case identity
-- ``gen_ai.evaluation.result`` event — score values
-  (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/)
+    span "test_suite_run <suite>"  test.suite.name, test.suite.run.id, test.suite.run.status
+      span "test_case <case>"      test.case.id, test.case.name, test.case.result.status,
+                                   opensearch.test_case.input / .expected / .output (record_io)
+        ... agent spans (evaluate() runs the task inside the case span)
+        LogRecord gen_ai.evaluation.result (parented to the test_case span, or to the
+                  linked agent span), with test.suite.name, test.suite.run.id,
+                  test.case.id and test.case.name copied as attributes
+
+- ``test.*`` follows the proposed test conventions
+  (semantic-conventions-genai#79, semantic-conventions#1262).
+- ``gen_ai.evaluation.result`` follows the GenAI events spec
+  (https://opentelemetry.io/docs/specs/semconv/gen-ai/gen-ai-events/).
+- Test case content lives under ``opensearch.test_case.*``; ``test.*`` is
+  owned by the OTel CICD SIG and has no names for it.
+
+Set ``OPENSEARCH_GENAI_EVAL_CARRIER=span`` (deprecated) to put scores on the
+case span as span events instead, or ``both`` while migrating.
 """
 
 from __future__ import annotations
@@ -55,8 +69,18 @@ from opentelemetry import trace
 from opentelemetry.trace import Link, SpanContext, SpanKind, TraceFlags
 
 from opensearch_genai_observability_sdk_py._internal import (
+    _RESERVED_KEYS,
     parse_hex,
     validate_metadata_keys,
+)
+from opensearch_genai_observability_sdk_py.score import (
+    EVALUATION_EVENT_NAME,
+    EXPLANATION_MAX_CHARS,
+    build_evaluation_attributes,
+    emit_evaluation_event,
+    resolve_carrier,
+    span_context_for,
+    warn_span_carrier_deprecated,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +105,17 @@ class EvalScore:
 
     name: str
     value: float
+    label: str | None = None
+    explanation: str | None = None
+    metadata: dict[str, Any] | None = None
+
+
+@dataclasses.dataclass
+class _FailedScore:
+    """Internal stand-in for a scorer that raised (no score value)."""
+
+    name: str
+    value: float | None = None
     label: str | None = None
     explanation: str | None = None
     metadata: dict[str, Any] | None = None
@@ -195,21 +230,58 @@ def _build_span_link(trace_id_hex: str, span_id_hex: str) -> Link | None:
     return Link(ctx)
 
 
-def _add_score_events(span: trace.Span, scores: dict[str, float]) -> None:
-    """Emit gen_ai.evaluation.result events on a span."""
-    for name, value in scores.items():
-        event_attrs: dict[str, Any] = {
-            "gen_ai.evaluation.name": name,
-            "gen_ai.evaluation.score.value": value,
-        }
-        span.add_event("gen_ai.evaluation.result", attributes=event_attrs)
+_GROUPING_KEYS = ("test.suite.name", "test.suite.run.id", "test.case.id", "test.case.name")
+
+
+def _case_span_name(case_name: str | None, case_id: str) -> str:
+    return f"test_case {case_name or case_id}"
+
+
+def _emit_scores(
+    case_span: trace.Span,
+    case_attrs: dict[str, Any],
+    scores: Iterable[EvalScore | _FailedScore],
+    *,
+    carrier: str,
+    event_context: Any = None,
+    evaluator: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    """Record scores as ``gen_ai.evaluation.result`` events.
+
+    ``carrier="event"`` (default) emits one log-based event per score, parented
+    to ``event_context`` (the evaluated span) or the case span, with the
+    ``test.*`` grouping attributes copied. ``"span"`` keeps the deprecated
+    span events on the case span; ``"both"`` does both.
+    """
+    grouping = {k: case_attrs[k] for k in _GROUPING_KEYS if k in case_attrs}
+    ctx = event_context or trace.set_span_in_context(case_span)
+
+    for s in scores:
+        extra = dict(grouping)
+        if s.metadata:
+            extra.update(_safe_metadata(s.metadata, context=f"EvalScore({s.name!r})"))
+        attrs = build_evaluation_attributes(
+            name=s.name,
+            value=s.value,
+            label=s.label,
+            explanation=s.explanation,
+            explanation_limit=EXPLANATION_MAX_CHARS,
+            level="span",
+            evaluator=evaluator,
+            error_type=error_type,
+            extra=extra,
+        )
+        if carrier in ("event", "both"):
+            emit_evaluation_event(attrs, context=ctx, evaluator=evaluator)
+        if carrier in ("span", "both"):
+            warn_span_carrier_deprecated()
+            case_span.add_event(EVALUATION_EVENT_NAME, attributes=attrs)
 
 
 def _safe_metadata(metadata: dict[str, Any], *, context: str = "") -> dict[str, Any]:
     """Filter out SDK-reserved keys from user metadata and warn."""
     validate_metadata_keys(metadata, context=context)
-    from opensearch_genai_observability_sdk_py._internal import _RESERVED_KEYS
-
     return {k: v for k, v in metadata.items() if k not in _RESERVED_KEYS}
 
 
@@ -277,8 +349,9 @@ class Benchmark:
         metadata: Arbitrary metadata attached to the root span.
             Keys starting with ``test.`` or ``gen_ai.`` are reserved
             and will be filtered out with a warning.
-        record_io: If ``True``, record input/output/expected as span
-            attributes. Default ``False`` (PII-safe).
+        record_io: If ``True``, record input/output/expected on the
+            ``test_case`` span as ``opensearch.test_case.input`` /
+            ``.output`` / ``.expected``. Default ``False`` (PII-safe).
     """
 
     def __init__(
@@ -295,13 +368,13 @@ class Benchmark:
         self._start_time = time.monotonic()
         self._cases: list[TestCaseResult] = []
         self._closed = False
+        self._carrier = resolve_carrier(None)
 
         tracer = trace.get_tracer(_TRACER_NAME)
 
         root_attrs: dict[str, Any] = {
             "test.suite.name": name,
             "test.suite.run.id": self._run_id,
-            "gen_ai.operation.name": "evaluation",
         }
         for key, val in self._metadata.items():
             root_attrs[key] = val
@@ -339,9 +412,9 @@ class Benchmark:
     ) -> None:
         """Log a single test case result.
 
-        Creates a ``test_case`` span as a child of the benchmark root,
-        with ``test.case.*`` attributes and ``gen_ai.evaluation.result``
-        events for each score.
+        Creates a ``test_case <case>`` span as a child of the benchmark
+        root, with ``test.case.*`` attributes, and one
+        ``gen_ai.evaluation.result`` log event per score.
 
         Args:
             input: Test case input data.
@@ -356,7 +429,8 @@ class Benchmark:
             case_name: Human-readable ``test.case.name``.
             trace_id: Hex trace ID to link to an existing agent trace.
             span_id: Hex span ID to link to a specific agent span.
-                Required when ``trace_id`` is provided.
+                Required when ``trace_id`` is provided. The case span links
+                to it and the score events are parented to it.
         """
         if self._closed:
             raise RuntimeError("Benchmark is already closed")
@@ -376,12 +450,11 @@ class Benchmark:
             "test.suite.run.id": self._run_id,
             "test.case.id": resolved_case_id,
             "test.case.result.status": status,
-            "gen_ai.operation.name": "evaluation",
         }
         if case_name:
             case_attrs["test.case.name"] = case_name
         if error:
-            case_attrs["test.case.error"] = error
+            case_attrs["opensearch.test_case.error"] = error
         if metadata:
             safe = _safe_metadata(metadata, context=f"Benchmark.log(case_id={resolved_case_id!r})")
             for key, val in safe.items():
@@ -390,33 +463,47 @@ class Benchmark:
         # Record IO if opted in
         if self._record_io:
             if input is not None:
-                case_attrs["test.case.input"] = _truncate_io(json.dumps(input, default=str))
+                case_attrs["opensearch.test_case.input"] = _truncate_io(
+                    json.dumps(input, default=str)
+                )
             if output is not None:
-                case_attrs["test.case.output"] = _truncate_io(json.dumps(output, default=str))
+                case_attrs["opensearch.test_case.output"] = _truncate_io(
+                    json.dumps(output, default=str)
+                )
             if expected is not None:
-                case_attrs["test.case.expected"] = _truncate_io(json.dumps(expected, default=str))
+                case_attrs["opensearch.test_case.expected"] = _truncate_io(
+                    json.dumps(expected, default=str)
+                )
 
         # Build span link if trace context provided
         if bool(trace_id) != bool(span_id):
             raise ValueError("Both trace_id and span_id must be provided together, or neither.")
         links: list[Link] = []
+        evaluated_ctx = None
         if trace_id and span_id:
             link = _build_span_link(trace_id, span_id)
             if link:
                 links.append(link)
+                evaluated_ctx = span_context_for(trace_id, span_id)
 
         # Create the case span as a child of the root
         tracer = trace.get_tracer(_TRACER_NAME)
         case_span = tracer.start_span(
-            "test_case",
+            _case_span_name(case_name, resolved_case_id),
             context=self._root_context,
             kind=SpanKind.INTERNAL,
             attributes=case_attrs,
             links=links or None,
         )
 
-        # Add score events
-        _add_score_events(case_span, scores)
+        # One gen_ai.evaluation.result event per score
+        _emit_scores(
+            case_span,
+            case_attrs,
+            [EvalScore(name=n, value=v) for n, v in scores.items()],
+            carrier=self._carrier,
+            event_context=evaluated_ctx,
+        )
 
         # Set error status if applicable
         if error:
@@ -511,7 +598,8 @@ def evaluate(
         metadata: Attached to the root benchmark span. Keys starting
             with ``test.`` or ``gen_ai.`` are reserved and will be
             filtered out with a warning.
-        record_io: Record input/output/expected as span attributes.
+        record_io: Record input/output/expected on the ``test_case`` span
+            as ``opensearch.test_case.input`` / ``.output`` / ``.expected``.
 
     Returns:
         ``BenchmarkResult`` with summary and per-case results.
@@ -519,13 +607,13 @@ def evaluate(
     run_id = _make_run_id()
     start_time = time.monotonic()
     tracer = trace.get_tracer(_TRACER_NAME)
+    carrier = resolve_carrier(None)
 
     safe_meta = _safe_metadata(metadata or {}, context=f"evaluate({name!r})")
 
     root_attrs: dict[str, Any] = {
         "test.suite.name": name,
         "test.suite.run.id": run_id,
-        "gen_ai.operation.name": "evaluation",
     }
     for key, val in safe_meta.items():
         root_attrs[key] = val
@@ -553,21 +641,22 @@ def evaluate(
             "test.suite.name": name,
             "test.suite.run.id": run_id,
             "test.case.id": case_id,
-            "gen_ai.operation.name": "evaluation",
         }
         if case_name_val:
             case_attrs["test.case.name"] = case_name_val
 
         if record_io:
             if input_val is not None:
-                case_attrs["test.case.input"] = _truncate_io(json.dumps(input_val, default=str))
+                case_attrs["opensearch.test_case.input"] = _truncate_io(
+                    json.dumps(input_val, default=str)
+                )
             if expected_val is not None:
-                case_attrs["test.case.expected"] = _truncate_io(
+                case_attrs["opensearch.test_case.expected"] = _truncate_io(
                     json.dumps(expected_val, default=str)
                 )
 
         case_span = tracer.start_span(
-            "test_case",
+            _case_span_name(case_name_val, case_id),
             context=root_context,
             kind=SpanKind.INTERNAL,
             attributes=case_attrs,
@@ -590,27 +679,22 @@ def evaluate(
 
         if record_io and output_val is not None:
             case_span.set_attribute(
-                "test.case.output",
+                "opensearch.test_case.output",
                 _truncate_io(json.dumps(output_val, default=str)),
             )
 
-        # Run scorers
+        # Run scorers; each scorer's results become gen_ai.evaluation.result
+        # events (evaluator = scorer function name).
         case_scores: dict[str, float] = {}
         scorer_errors: list[str] = []
         if error_msg is None:
             for scorer_fn in scores:
+                scorer_name = getattr(scorer_fn, "__name__", str(scorer_fn))
+                # Named scorers identify the evaluator; lambdas etc. do not.
+                evaluator = scorer_name if scorer_name.isidentifier() else None
                 try:
                     result = scorer_fn(input_val, output_val, expected_val)
-                    if isinstance(result, EvalScore):
-                        case_scores[result.name] = result.value
-                    elif isinstance(result, list):
-                        for s in result:
-                            if isinstance(s, EvalScore):
-                                case_scores[s.name] = s.value
-                    elif isinstance(result, (int, float)):
-                        case_scores[scorer_fn.__name__] = float(result)
                 except Exception as exc:
-                    scorer_name = getattr(scorer_fn, "__name__", str(scorer_fn))
                     msg = f"Scorer {scorer_name} failed: {exc}"
                     scorer_errors.append(msg)
                     logger.warning(
@@ -619,9 +703,33 @@ def evaluate(
                         case_id,
                         exc,
                     )
+                    # Record the evaluator failure (error.type, no score value).
+                    _emit_scores(
+                        case_span,
+                        case_attrs,
+                        [_FailedScore(name=scorer_name, explanation=str(exc))],
+                        carrier=carrier,
+                        evaluator=evaluator,
+                        error_type=type(exc).__qualname__,
+                    )
+                    continue
 
-        # Add score events
-        _add_score_events(case_span, case_scores)
+                produced: list[EvalScore] = []
+                if isinstance(result, EvalScore):
+                    produced.append(result)
+                elif isinstance(result, list):
+                    produced.extend(s for s in result if isinstance(s, EvalScore))
+                elif isinstance(result, (int, float)):
+                    produced.append(EvalScore(name=scorer_name, value=float(result)))
+                for s in produced:
+                    case_scores[s.name] = s.value
+                _emit_scores(
+                    case_span,
+                    case_attrs,
+                    produced,
+                    carrier=carrier,
+                    evaluator=evaluator,
+                )
 
         # Determine status — fail if task errored or any scorer errored
         if error_msg:

@@ -22,7 +22,11 @@ import pytest
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
-from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter, _SigV4AuthSession
+from opensearch_genai_observability_sdk_py.exporters import (
+    AWSSigV4OTLPExporter,
+    AWSSigV4OTLPLogExporter,
+    _SigV4AuthSession,
+)
 
 # ---------------------------------------------------------------------------
 # Shared test fixtures
@@ -247,6 +251,66 @@ class TestAWSSigV4OTLPExporterInit:
 
         assert request.call_count >= 1
         assert request.call_args.args[0] is exporter.signing_session
+
+
+# ---------------------------------------------------------------------------
+# AWSSigV4OTLPLogExporter: evaluation events over OTLP logs
+# ---------------------------------------------------------------------------
+
+
+class TestAWSSigV4OTLPLogExporter:
+    _mock_botocore = TestAWSSigV4OTLPExporterInit._mock_botocore
+
+    def test_create_log_exporter_derives_logs_path(self):
+        with self._mock_botocore():
+            span_exporter = AWSSigV4OTLPExporter(endpoint=ENDPOINT, service="osis")
+            log_exporter = span_exporter.create_log_exporter()
+        assert isinstance(log_exporter, AWSSigV4OTLPLogExporter)
+        assert log_exporter._endpoint == "https://pipeline.us-east-1.osis.amazonaws.com/v1/logs"
+        assert log_exporter.signing_session._service == "osis"
+        assert log_exporter.signing_session._region == REGION
+        # Separate session object per exporter
+        assert log_exporter.signing_session is not span_exporter.signing_session
+
+    def test_create_log_exporter_explicit_endpoint(self):
+        with self._mock_botocore():
+            span_exporter = AWSSigV4OTLPExporter(endpoint=ENDPOINT, region="eu-west-1")
+            log_exporter = span_exporter.create_log_exporter(
+                endpoint="https://logs-pipeline.eu-west-1.osis.amazonaws.com/v1/logs"
+            )
+        assert log_exporter._endpoint.startswith("https://logs-pipeline.")
+        assert log_exporter.signing_session._region == "eu-west-1"
+
+    def test_raises_if_no_credentials(self):
+        with self._mock_botocore(credentials=None):
+            with pytest.raises(RuntimeError, match="No AWS credentials found"):
+                AWSSigV4OTLPLogExporter(endpoint=ENDPOINT, region=REGION)
+
+    def test_exports_logs_through_the_signing_session(self):
+        from opentelemetry.sdk._logs import LoggerProvider
+        from opentelemetry.sdk._logs.export import SimpleLogRecordProcessor
+
+        with self._mock_botocore():
+            exporter = AWSSigV4OTLPLogExporter(
+                endpoint="https://pipeline.us-east-1.osis.amazonaws.com/v1/logs"
+            )
+        response = MagicMock(status_code=200, ok=True)
+        with patch.object(
+            _SigV4AuthSession, "request", autospec=True, return_value=response
+        ) as request:
+            provider = LoggerProvider()
+            provider.add_log_record_processor(SimpleLogRecordProcessor(exporter))
+            provider.get_logger("test").emit(
+                event_name="gen_ai.evaluation.result",
+                attributes={"gen_ai.evaluation.name": "relevance"},
+            )
+            provider.shutdown()
+
+        assert request.call_count >= 1
+        assert request.call_args.args[0] is exporter.signing_session
+        call = request.call_args
+        url = call.kwargs.get("url") or call.args[2]
+        assert url.endswith("/v1/logs")
 
 
 # ---------------------------------------------------------------------------

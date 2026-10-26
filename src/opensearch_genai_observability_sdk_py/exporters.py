@@ -7,11 +7,12 @@
 # Modifications Copyright OpenSearch Contributors. See
 # GitHub history for details.
 
-"""OTLP span exporters with AWS SigV4 support.
+"""OTLP span and log exporters with AWS SigV4 support.
 
-Provides a drop-in replacement for OTLPSpanExporter that signs
-requests using AWS Signature Version 4 for AWS-hosted OpenSearch
-and Data Prepper endpoints.
+Provides drop-in replacements for OTLPSpanExporter and OTLPLogExporter that
+sign requests using AWS Signature Version 4 for AWS-hosted OpenSearch
+and Data Prepper endpoints. The log exporter carries the
+``gen_ai.evaluation.result`` events emitted by ``score()``.
 
 Design note
 -----------
@@ -39,7 +40,10 @@ import logging
 from typing import Any
 
 import requests  # type: ignore[import-untyped]
+from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+from opensearch_genai_observability_sdk_py._internal import derive_logs_endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -126,37 +130,103 @@ class AWSSigV4OTLPExporter(OTLPSpanExporter):
         region: str | None = None,
         **kwargs: Any,
     ) -> None:
-        import botocore.session
-
-        botocore_session = botocore.session.get_session()
-        credentials = botocore_session.get_credentials()
-        resolved_region = region or botocore_session.get_config_variable("region")
-
-        if not credentials:
-            raise RuntimeError(
-                "No AWS credentials found. Configure credentials via environment "
-                "variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY), "
-                "~/.aws/credentials, or an IAM role."
-            )
-        if not resolved_region:
-            raise RuntimeError(
-                "No AWS region found. Set the region via the 'region' parameter, "
-                "AWS_DEFAULT_REGION environment variable, or ~/.aws/config."
-            )
-
         # Pass the signing session to OTLPSpanExporter, which routes all HTTP
         # calls through it. Keep our own reference: where the parent stores the
         # session is an implementation detail (1.45 moved it into a transport).
-        self.signing_session = _SigV4AuthSession(
-            credentials=credentials,
-            service=service,
-            region=resolved_region,
-        )
+        self.signing_session = _make_signing_session(service, region)
+        self.service = service
+        self.region = self.signing_session._region
         kwargs["session"] = self.signing_session
         super().__init__(*args, **kwargs)
 
         logger.info(
             "AWSSigV4OTLPExporter initialized for service=%s region=%s",
             service,
-            resolved_region,
+            self.region,
         )
+
+    @property
+    def endpoint(self) -> str:
+        """The resolved OTLP traces endpoint this exporter sends to."""
+        return str(self._endpoint)
+
+    def create_log_exporter(self, endpoint: str | None = None) -> AWSSigV4OTLPLogExporter:
+        """Create a SigV4 log exporter with the same service and region.
+
+        Args:
+            endpoint: OTLP logs URL. Defaults to this exporter's endpoint with
+                ``/v1/traces`` swapped for ``/v1/logs``. Pipelines whose source
+                only accepts traces need a separate logs pipeline URL here.
+        """
+        return AWSSigV4OTLPLogExporter(
+            endpoint=endpoint or derive_logs_endpoint(self.endpoint),
+            service=self.service,
+            region=self.region,
+        )
+
+
+class AWSSigV4OTLPLogExporter(OTLPLogExporter):
+    """OTLP HTTP log exporter that signs requests with AWS SigV4.
+
+    Same credential and region resolution as ``AWSSigV4OTLPExporter``.
+    ``register(exporter=AWSSigV4OTLPExporter(...))`` creates one
+    automatically; build it directly to point logs at a different pipeline.
+
+    Args:
+        endpoint: The OTLP logs endpoint URL (``.../v1/logs``).
+        service: The AWS service name for signing (``"osis"`` or ``"es"``).
+        region: AWS region. Auto-detected from botocore if not provided.
+        **kwargs: Additional arguments passed to OTLPLogExporter.
+
+    Example:
+        log_exporter = AWSSigV4OTLPLogExporter(
+            endpoint="https://pipeline.us-east-1.osis.amazonaws.com/v1/logs",
+            service="osis",
+        )
+    """
+
+    def __init__(
+        self,
+        *args: Any,
+        service: str = "osis",
+        region: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self.signing_session = _make_signing_session(service, region)
+        self.service = service
+        self.region = self.signing_session._region
+        kwargs["session"] = self.signing_session
+        super().__init__(*args, **kwargs)
+
+        logger.info(
+            "AWSSigV4OTLPLogExporter initialized for service=%s region=%s",
+            service,
+            self.region,
+        )
+
+
+def _make_signing_session(service: str, region: str | None) -> _SigV4AuthSession:
+    """Resolve AWS credentials/region via botocore and build a signing session."""
+    import botocore.session
+
+    botocore_session = botocore.session.get_session()
+    credentials = botocore_session.get_credentials()
+    resolved_region = region or botocore_session.get_config_variable("region")
+
+    if not credentials:
+        raise RuntimeError(
+            "No AWS credentials found. Configure credentials via environment "
+            "variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY), "
+            "~/.aws/credentials, or an IAM role."
+        )
+    if not resolved_region:
+        raise RuntimeError(
+            "No AWS region found. Set the region via the 'region' parameter, "
+            "AWS_DEFAULT_REGION environment variable, or ~/.aws/config."
+        )
+
+    return _SigV4AuthSession(
+        credentials=credentials,
+        service=service,
+        region=resolved_region,
+    )

@@ -11,7 +11,10 @@
 
 The register() function is the single entry point for configuring
 tracing. It creates a TracerProvider, sets up the exporter, and
-auto-discovers installed instrumentor packages.
+auto-discovers installed instrumentor packages. It also sets up a
+LoggerProvider with an OTLP log exporter on the same endpoint and auth, so
+``score()`` evaluation events (``gen_ai.evaluation.result``) are exported to
+``/v1/logs``.
 
 Endpoint resolution (priority order)
 -------------------------------------
@@ -53,6 +56,22 @@ For authenticated endpoints (e.g. AWS OSIS), pass a custom exporter:
 
 Note: AWSSigV4OTLPExporter is HTTP-only. AWS OSIS does not expose a gRPC
 endpoint.
+
+Logs endpoint resolution (priority order)
+------------------------------------------
+1. ``logs_endpoint=`` parameter: full URL, used as-is.
+2. Derived from ``endpoint=`` (``/v1/traces`` swapped for ``/v1/logs``).
+3. ``OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`` env var: full URL, used as-is.
+4. ``OTEL_EXPORTER_OTLP_ENDPOINT`` env var: base URL; ``/v1/logs`` appended.
+5. Derived from ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT``.
+6. Data Prepper default: ``http://localhost:21890/opentelemetry/v1/logs``
+
+The logs protocol follows ``protocol=``, then
+``OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`` / ``OTEL_EXPORTER_OTLP_PROTOCOL``, then
+the URL scheme. With ``exporter=AWSSigV4OTLPExporter(...)`` the log exporter
+is an ``AWSSigV4OTLPLogExporter`` with the same service/region, on the
+exporter's endpoint with ``/v1/logs``. Any other custom ``exporter=`` needs an
+explicit ``log_exporter=``; otherwise the logs pipeline is skipped.
 """
 
 from __future__ import annotations
@@ -60,10 +79,12 @@ from __future__ import annotations
 import logging
 import os
 from importlib.metadata import entry_points
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
-from opentelemetry import trace
+from opentelemetry import _logs, trace
+from opentelemetry.sdk._logs import LoggerProvider
+from opentelemetry.sdk._logs.export import BatchLogRecordProcessor, SimpleLogRecordProcessor
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import (
@@ -73,9 +94,12 @@ from opentelemetry.sdk.trace.export import (
     SpanProcessor,
 )
 
+from opensearch_genai_observability_sdk_py._internal import derive_logs_endpoint
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENDPOINT = "http://localhost:21890/opentelemetry/v1/traces"
+DEFAULT_LOGS_ENDPOINT = "http://localhost:21890/opentelemetry/v1/logs"
 
 # Entry point group to discover instrumentors from.
 # OpenLLMetry + official OTel instrumentors register under this group.
@@ -96,6 +120,9 @@ def register(
     exporter: SpanExporter | None = None,
     set_global: bool = True,
     headers: dict | None = None,
+    enable_logs: bool = True,
+    logs_endpoint: str | None = None,
+    log_exporter: Any | None = None,
 ) -> TracerProvider:
     """Configure the OTel tracing pipeline for OpenSearch.
 
@@ -162,10 +189,26 @@ def register(
             exporters such as ``AWSSigV4OTLPExporter``.
         set_global: Set as the global ``TracerProvider`` (default: ``True``).
         headers: Additional HTTP headers for the default OTLP exporter.
+            Also sent by the default OTLP log exporter.
             Ignored if ``exporter`` is provided.
+        enable_logs: Also configure a ``LoggerProvider`` (OTLP logs) so that
+            ``score()`` evaluation events are exported (default: ``True``).
+            Only done when ``set_global`` is ``True`` and no global
+            ``LoggerProvider`` is configured yet; an existing one is reused
+            as-is.
+        logs_endpoint: OTLP logs endpoint (full URL). When omitted, derived
+            from the traces endpoint (``/v1/traces`` swapped for ``/v1/logs``)
+            or resolved from ``OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`` /
+            ``OTEL_EXPORTER_OTLP_ENDPOINT``. Ignored if ``log_exporter`` is
+            provided.
+        log_exporter: Custom ``LogRecordExporter``. Required to export logs
+            when a custom ``exporter`` other than ``AWSSigV4OTLPExporter``
+            is passed.
 
     Returns:
-        The configured ``TracerProvider``.
+        The configured ``TracerProvider``. Its ``force_flush()`` and
+        ``shutdown()`` also flush and shut down the logs pipeline that
+        ``register()`` created.
 
     Raises:
         ValueError: If ``protocol`` contradicts the URL scheme, or if an
@@ -179,7 +222,7 @@ def register(
         # OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
         register()
 
-        # Explicit endpoint
+        # Explicit endpoint (logs go to http://my-collector:4318/v1/logs)
         register(endpoint="http://my-collector:4318/v1/traces")
 
         # gRPC via URL scheme
@@ -215,6 +258,7 @@ def register(
     provider = TracerProvider(resource=resource)
 
     # Step 3: Create Exporter
+    custom_exporter = exporter is not None
     if exporter is None:
         exporter = _create_exporter(
             endpoint=resolved_endpoint,
@@ -234,7 +278,21 @@ def register(
     if set_global:
         trace.set_tracer_provider(provider)
 
-    # Step 6: Auto-instrument installed libraries
+    # Step 6: Logs pipeline for evaluation events (score())
+    if enable_logs and set_global:
+        _setup_logs(
+            provider=provider,
+            resource=resource,
+            batch=batch,
+            span_exporter=exporter if custom_exporter else None,
+            endpoint=endpoint,
+            logs_endpoint=logs_endpoint,
+            protocol=protocol,
+            headers=headers,
+            log_exporter=log_exporter,
+        )
+
+    # Step 7: Auto-instrument installed libraries
     if auto_instrument:
         _auto_instrument(provider)
 
@@ -268,6 +326,144 @@ def _resolve_endpoint(endpoint: str | None) -> str:
         return base_ep.rstrip("/") + "/v1/traces"
 
     return DEFAULT_ENDPOINT
+
+
+def _resolve_logs_endpoint(endpoint: str | None, logs_endpoint: str | None) -> str:
+    """Resolve the OTLP logs endpoint (see module docstring for priority)."""
+    if logs_endpoint:
+        return logs_endpoint
+    if endpoint:
+        return derive_logs_endpoint(endpoint)
+
+    logs_ep = os.environ.get("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT")
+    if logs_ep:
+        return logs_ep
+
+    base_ep = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if base_ep:
+        return base_ep.rstrip("/") + "/v1/logs"
+
+    traces_ep = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+    if traces_ep:
+        return derive_logs_endpoint(traces_ep)
+
+    return DEFAULT_LOGS_ENDPOINT
+
+
+def _resolve_logs_protocol(protocol: str | None) -> str | None:
+    """Resolve the OTLP logs protocol from code param or env vars."""
+    if protocol is not None:
+        return protocol
+
+    return os.environ.get("OTEL_EXPORTER_OTLP_LOGS_PROTOCOL") or os.environ.get(
+        "OTEL_EXPORTER_OTLP_PROTOCOL"
+    )
+
+
+def _global_logger_provider_is_set() -> bool:
+    """Return ``True`` if a global LoggerProvider has already been configured."""
+    current = _logs.get_logger_provider()
+    try:
+        from opentelemetry._logs._internal import ProxyLoggerProvider
+    except ImportError:  # pragma: no cover - layout of older/newer OTel APIs
+        return isinstance(current, LoggerProvider)
+    return not isinstance(current, ProxyLoggerProvider)
+
+
+class _LoggerProviderLifecycle(SpanProcessor):
+    """Ties a LoggerProvider's flush/shutdown to the TracerProvider.
+
+    Registered as the last span processor so ``TracerProvider.force_flush()``
+    and ``TracerProvider.shutdown()`` (including the atexit shutdown) also
+    flush the evaluation events.
+    """
+
+    def __init__(self, logger_provider: LoggerProvider) -> None:
+        self._logger_provider = logger_provider
+
+    def shutdown(self) -> None:
+        self._logger_provider.shutdown()
+
+    def force_flush(self, timeout_millis: int = 30000) -> bool:
+        return self._logger_provider.force_flush(timeout_millis)
+
+
+def _setup_logs(
+    *,
+    provider: TracerProvider,
+    resource: Resource,
+    batch: bool,
+    span_exporter: SpanExporter | None,
+    endpoint: str | None,
+    logs_endpoint: str | None,
+    protocol: str | None,
+    headers: dict | None,
+    log_exporter: Any | None,
+) -> LoggerProvider | None:
+    """Create and install the global LoggerProvider used by ``score()``."""
+    if _global_logger_provider_is_set():
+        logger.info(
+            "A global LoggerProvider is already configured; evaluation events use it as-is."
+        )
+        return None
+
+    if log_exporter is None:
+        if span_exporter is not None:
+            log_exporter = _log_exporter_for_custom(span_exporter, logs_endpoint)
+            if log_exporter is None:
+                logger.warning(
+                    "register(): custom exporter %s has no matching log exporter; "
+                    "evaluation events from score() will not be exported. "
+                    "Pass log_exporter= to enable them.",
+                    type(span_exporter).__name__,
+                )
+                return None
+        else:
+            resolved = _resolve_logs_endpoint(endpoint, logs_endpoint)
+            log_exporter = _create_log_exporter(
+                endpoint=resolved,
+                protocol=_resolve_logs_protocol(protocol),
+                headers=headers,
+            )
+            logger.info("OpenSearch AI evaluation events: logs endpoint=%s", resolved)
+
+    logger_provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
+    if batch:
+        logger_provider.add_log_record_processor(BatchLogRecordProcessor(log_exporter))
+    else:
+        logger_provider.add_log_record_processor(SimpleLogRecordProcessor(log_exporter))
+
+    _logs.set_logger_provider(logger_provider)
+    provider.add_span_processor(_LoggerProviderLifecycle(logger_provider))
+    return logger_provider
+
+
+def _log_exporter_for_custom(span_exporter: SpanExporter, logs_endpoint: str | None) -> Any | None:
+    """Build a log exporter matching a custom span exporter, if we know how."""
+    from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
+
+    if isinstance(span_exporter, AWSSigV4OTLPExporter):
+        return span_exporter.create_log_exporter(endpoint=logs_endpoint)
+    return None
+
+
+def _create_log_exporter(endpoint: str, protocol: str | None, headers: dict | None) -> Any:
+    """Create a plain OTLP log exporter based on protocol and endpoint."""
+    if _infer_protocol(endpoint, protocol) == "grpc":
+        from opentelemetry.exporter.otlp.proto.grpc._log_exporter import (
+            OTLPLogExporter as GRPCLogExporter,
+        )
+
+        parsed = urlparse(endpoint)
+        scheme = parsed.scheme.lower()
+        insecure = scheme != "grpcs" and scheme != "https"
+        return GRPCLogExporter(
+            endpoint=parsed.netloc or endpoint, insecure=insecure, headers=headers
+        )
+
+    from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
+
+    return OTLPLogExporter(endpoint=endpoint, headers=headers)
 
 
 def _resolve_protocol(protocol: str | None) -> str | None:

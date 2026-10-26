@@ -165,6 +165,8 @@ class OpenSearchTraceRetriever:
     Args:
         host: OpenSearch endpoint (e.g. ``https://localhost:9200``).
         index: Index pattern for span data.
+        evaluation_index: Index pattern for evaluation results
+            (``gen_ai.evaluation.result`` events routed by Data Prepper).
         auth: Authentication — either a ``(username, password)`` tuple for
             basic auth, or a ``RequestsAWSV4SignerAuth`` instance for SigV4.
         verify_certs: Whether to verify TLS certificates.
@@ -174,6 +176,7 @@ class OpenSearchTraceRetriever:
         self,
         host: str = "https://localhost:9200",
         index: str = "otel-v1-apm-span-*",
+        evaluation_index: str = "otel-v1-genai-evaluation*",
         auth: tuple[str, str] | RequestsAWSV4SignerAuth | None = None,
         verify_certs: bool = True,
     ):
@@ -198,6 +201,7 @@ class OpenSearchTraceRetriever:
 
         self._client = OpenSearch(**kwargs)
         self._index = index
+        self._evaluation_index = evaluation_index
 
     @staticmethod
     def _get_requests_connection() -> Any:
@@ -263,9 +267,15 @@ class OpenSearchTraceRetriever:
         return [map_span_doc(doc) for doc in self._search(body)]
 
     def find_evaluated_trace_ids(self, trace_ids: list[str]) -> set[str]:
-        """Return the subset of trace_ids that already have an evaluation span."""
+        """Return the subset of trace_ids that already have an evaluation result.
+
+        Checks both the evaluation index (``gen_ai.evaluation.result`` events,
+        matched on ``traceId`` or ``opensearch.evaluation.trace_id``) and the
+        span index (deprecated ``evaluation`` spans).
+        """
         if not trace_ids:
             return set()
+        evaluated = self._find_in_evaluation_index(trace_ids)
         body = {
             "size": 0,
             "query": {
@@ -279,9 +289,48 @@ class OpenSearchTraceRetriever:
             "aggs": {"evaluated": {"terms": {"field": "traceId", "size": len(trace_ids)}}},
         }
         resp = self._client.search(index=self._index, body=body)
-        return {
+        evaluated |= {
             b["key"] for b in resp.get("aggregations", {}).get("evaluated", {}).get("buckets", [])
         }
+        return evaluated
+
+    def _find_in_evaluation_index(self, trace_ids: list[str]) -> set[str]:
+        """Trace ids with ``gen_ai.evaluation.result`` events in the evaluation index."""
+        target_field = "attributes.opensearch.evaluation.trace_id"
+        body = {
+            "size": 0,
+            "query": {
+                "bool": {
+                    "should": [
+                        {"terms": {"traceId": trace_ids}},
+                        {"terms": {target_field: trace_ids}},
+                    ],
+                    "minimum_should_match": 1,
+                }
+            },
+            "aggs": {
+                "by_trace": {"terms": {"field": "traceId", "size": len(trace_ids)}},
+                "by_target": {"terms": {"field": target_field, "size": len(trace_ids)}},
+            },
+        }
+        try:
+            resp = self._client.search(
+                index=self._evaluation_index,
+                body=body,
+                ignore_unavailable=True,
+                allow_no_indices=True,
+            )
+        except Exception as exc:  # index or mapping may not exist yet
+            logger.debug("Evaluation index lookup failed: %s", exc)
+            return set()
+        aggs = resp.get("aggregations", {})
+        wanted = set(trace_ids)
+        found = {
+            b["key"]
+            for agg in ("by_trace", "by_target")
+            for b in aggs.get(agg, {}).get("buckets", [])
+        }
+        return found & wanted
 
     # --- queries ---
 
