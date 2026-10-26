@@ -13,6 +13,11 @@ Most teams already have eval pipelines (RAGAS, DeepEval, pytest, custom).
 This example shows how to upload those results to OpenSearch via the SDK,
 so you can visualize and compare them in the agent-health UI.
 
+Each b.log() creates a "test_case <case>" span under the "test_suite_run"
+span and one gen_ai.evaluation.result log event per score (exported to
+/v1/logs, indexed in otel-v1-genai-evaluation). With trace_id/span_id the
+case span links to the agent span and the events are parented to it.
+
 Three patterns:
     A. Upload from a list of dicts (any eval framework)
     B. Upload from RAGAS results
@@ -167,7 +172,7 @@ def upload_with_trace_links():
                 output=r["answer"],
                 scores={"accuracy": r["accuracy"]},
                 trace_id=r["trace_id"],  # Links to the original agent trace
-                span_id=r["span_id"],    # Links to the specific agent span
+                span_id=r["span_id"],    # Score events are parented to this agent span
                 case_id=r["question"][:20].replace(" ", "_").lower(),
             )
 

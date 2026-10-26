@@ -12,6 +12,14 @@
 Run the same test cases across different prompt versions, with full traces
 and scores stored in OpenSearch for comparison.
 
+Telemetry: a "test_suite_run rag-agent" span with one "test_case <id>" child
+per case (agent spans nest under it). Each score is a gen_ai.evaluation.result
+log event parented to its test_case span, with test.suite.name,
+test.suite.run.id, test.case.id and test.case.name copied onto the event.
+Data Prepper routes the events to the otel-v1-genai-evaluation index.
+record_io=True stores input/expected/output on the test_case span as
+opensearch.test_case.input / .expected / .output.
+
 Usage:
     AGENT_VERSION=v1 python examples/07_benchmarks.py
     AGENT_VERSION=v2 python examples/07_benchmarks.py
