@@ -10,7 +10,7 @@ OTel-native tracing and scoring for LLM applications. Instrument your AI workflo
 - **`mark_agent_root()`** — mark the agent's span as the trace's agent root in OpenSearch Agent Traces
 - **Auto-instrumentation** — automatically discovers and activates installed instrumentor packages (OpenAI, Anthropic, Bedrock, LangChain, etc.)
 - **Scoring**: `score()` emits each evaluation result as an OTel `gen_ai.evaluation.result` log event, parented to the evaluated span, at span, trace, session, or tool-call level
-- **Benchmarks** — `evaluate()` runs your agent against a dataset with scorers; `Benchmark` uploads results from any eval framework (RAGAS, DeepEval, pytest)
+- **Benchmarks**: `evaluate()` runs your agent against a dataset with scorers; `Benchmark` uploads results from any eval framework (RAGAS, DeepEval, pytest). Cases, scores and runs are recorded as OTel log events; each agent run stays its own trace
 - **AWS SigV4** — built-in SigV4 signing for AWS-hosted OpenSearch and Data Prepper endpoints
 - **Zero lock-in** — remove a decorator and your code still works; everything is standard OTel
 
@@ -415,7 +415,7 @@ If you configure OTel yourself instead of calling `register()`, install a global
 
 ### `evaluate()`
 
-Run a task against a dataset, score outputs, and record results as OTel spans plus one `gen_ai.evaluation.result` event per score. Agent execution spans are children of each case span, giving full trace waterfall per case.
+Run a task against a dataset, score outputs, and record results as OTel log events. Each case's agent run is its own trace, exactly like production: the SDK adds no span around it.
 
 ```python
 from opensearch_genai_observability_sdk_py import evaluate, EvalScore, observe, Op
@@ -443,18 +443,40 @@ result = evaluate(
 )
 ```
 
-Produces:
+Produces, per case:
 ```
-span test_suite_run rag-agent      test.suite.name, test.suite.run.id, test.suite.run.status
- └── span test_case <case>          test.case.id, test.case.name, test.case.result.status,
-      │                             opensearch.test_case.input / .expected / .output (record_io)
-      ├── span invoke_agent my_agent
-      └── event gen_ai.evaluation.result  (parented to the test_case span; one per score,
-                                           with test.suite.name, test.suite.run.id,
-                                           test.case.id, test.case.name copied)
+trace (the agent run)
+ └── span invoke_agent my_agent        root span, stamped with test.suite.name, test.suite.run.id,
+      └── ... normal GenAI spans        test.case.id, test.case.name
+
+event gen_ai.evaluation.result          one per score, parented to the agent root span,
+                                        with the test.* ids copied
+event opensearch.test_case.result       one per case, parented to the agent root span:
+                                        test.* ids, test.case.result.status (pass | fail | error),
+                                        error.type, opensearch.test_case.duration_ms,
+                                        opensearch.test_case.input / .expected / .output (record_io),
+                                        run metadata
 ```
 
-Each scorer is the evaluator: a named scorer function sets the event's instrumentation scope and `opensearch.evaluation.evaluator.name`. `EvalScore.label`, `.explanation`, and `.metadata` go on the event. A scorer that raises produces an event with `error.type` and no score value.
+and once per run:
+```
+event opensearch.test_suite_run.result  no trace context: test.suite.name, test.suite.run.id,
+                                        test.suite.run.status (success | failure),
+                                        opensearch.test_suite_run.case_count / .pass_count /
+                                        .fail_count / .error_count / .duration_ms, run metadata
+```
+
+All three event names are routed by Data Prepper to `otel-v1-genai-evaluation-*`; filter on `eventName`.
+
+- The `test.*` ids are stamped on every root span the task starts (a span with no local parent) by a span processor that `evaluate()` installs once on the global SDK `TracerProvider`. Spans started outside `evaluate()` are not touched. Instrument the agent with the global provider (for example `@observe()` after `register()`).
+- If the task starts no span, the case and score events carry no trace context (the `test.*` attributes are still set).
+- A task that raises does not stop the run: the case event has status `error` and `error.type` (the exception class), and the scorers for that case are skipped. A scorer that raises produces an evaluation event with `error.type` and no score value, and marks the case `error`. A run with any errored case has status `failure`.
+- Scorers run outside the agent trace, so a traced LLM judge gets its own trace.
+- `TestCaseResult.status` keeps its historical values (`pass` / `fail`, a task or scorer error is `fail`). New fields: `error_type`, `duration_ms`, and `trace_id` / `span_id` of the span the events are parented to.
+
+Each scorer is the evaluator: a named scorer function sets the event's instrumentation scope and `opensearch.evaluation.evaluator.name`. `EvalScore.label`, `.explanation`, and `.metadata` go on the event.
+
+**Previous span layout.** `trace_structure=True` restores the `test_suite_run <suite>` span with one `test_case <case>` child per case (the task runs inside the case span and the score and case events are parented to it) and still emits the case and run events.
 
 **Parameters:**
 
@@ -462,18 +484,19 @@ Each scorer is the evaluator: a named scorer function sets the event's instrumen
 |---|---|---|
 | `name` | `str` | Benchmark name (`test.suite.name`). Stable across runs |
 | `task` | `Callable` | Function that takes input and returns output. Decorate with `@observe()` for tracing |
-| `data` | `list[dict]` | Dicts with `"input"` and optionally `"expected"`, `"case_id"` |
+| `data` | `list[dict]` | Dicts with `"input"` and optionally `"expected"`, `"case_id"`, `"case_name"` |
 | `scores` | `list[Callable]` | Scorer functions. Each receives `(input, output, expected)` and returns `EvalScore`, `list[EvalScore]`, or `float` |
-| `metadata` | `dict` | Attached to root span. Reserved keys (`test.*`, `gen_ai.*`) are filtered |
-| `record_io` | `bool` | Record input/output/expected on the `test_case` span as `opensearch.test_case.input` / `.output` / `.expected` (default `False`) |
+| `metadata` | `dict` | Added to the case and run events (and the root span with `trace_structure=True`). SDK-reserved keys are filtered |
+| `record_io` | `bool` | Record input/output/expected on the case event (and the `test_case` span) as `opensearch.test_case.input` / `.output` / `.expected` (default `False`) |
+| `trace_structure` | `bool` | Also create the `test_suite_run` / `test_case` spans (default `False`) |
 
 Returns `BenchmarkResult` with `.summary` (aggregate stats) and `.cases` (per-case results).
 
 ### `Benchmark`
 
-Upload pre-computed evaluation results from any framework (RAGAS, DeepEval, pytest, custom) as `test_suite_run` / `test_case` spans plus one `gen_ai.evaluation.result` event per score. Use when you already have results and want to visualize them in agent-health or OpenSearch Dashboards.
+Upload pre-computed evaluation results from any framework (RAGAS, DeepEval, pytest, custom) as the same events: one `opensearch.test_case.result` event per `log()`, one `gen_ai.evaluation.result` event per score, and one `opensearch.test_suite_run.result` event on `close()`. Use when you already have results and want to visualize them in agent-health or OpenSearch Dashboards.
 
-Score events are parented to the case span, or to the linked agent span when `trace_id` / `span_id` are given. Earlier releases wrote `test.case.input` / `.output` / `.expected` / `.error`; these are now `opensearch.test_case.*` because `test.*` has no such names upstream. `OPENSEARCH_GENAI_EVAL_CARRIER=span` (deprecated) puts scores back on the case span as span events.
+When `trace_id` / `span_id` of the agent run are given, the case and score events are parented to that span; otherwise they carry no trace context. `log()` also accepts `status` (`pass` / `fail` / `error`; default `error` when `error` is given, else `pass`), `error_type` and `duration_ms`. `Benchmark(..., trace_structure=True)` also creates the previous `test_suite_run` / `test_case` spans. Earlier releases wrote `test.case.input` / `.output` / `.expected` / `.error`; these are now `opensearch.test_case.*` because `test.*` has no such names upstream. `OPENSEARCH_GENAI_EVAL_CARRIER=span` (deprecated) records scores as span events instead.
 
 ```python
 from opensearch_genai_observability_sdk_py import Benchmark
@@ -481,9 +504,9 @@ from opensearch_genai_observability_sdk_py import Benchmark
 # Upload results from your eval pipeline
 with Benchmark(name="nightly-eval", metadata={"model": "gpt-4o"}, record_io=True) as b:
     b.log(input="What is Python?", output="A language", scores={"accuracy": 1.0})
-    b.log(input="Capital of France?", output="Paris", scores={"accuracy": 1.0})
+    b.log(input="Capital of France?", output="Paris", scores={"accuracy": 1.0}, status="pass")
 
-# Link to existing agent traces (click through from failed case → agent trace)
+# Link to existing agent traces (click through from a failed case to the agent trace)
 with Benchmark(name="ci-eval") as b:
     b.log(
         input="query",

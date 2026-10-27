@@ -12,13 +12,16 @@
 Run the same test cases across different prompt versions, with full traces
 and scores stored in OpenSearch for comparison.
 
-Telemetry: a "test_suite_run rag-agent" span with one "test_case <id>" child
-per case (agent spans nest under it). Each score is a gen_ai.evaluation.result
-log event parented to its test_case span, with test.suite.name,
-test.suite.run.id, test.case.id and test.case.name copied onto the event.
-Data Prepper routes the events to the otel-v1-genai-evaluation index.
-record_io=True stores input/expected/output on the test_case span as
-opensearch.test_case.input / .expected / .output.
+Telemetry: no harness spans. Each case's agent run is its own trace, and its
+root span gets test.suite.name, test.suite.run.id, test.case.id and
+test.case.name. Per case the SDK emits one gen_ai.evaluation.result log event
+per score and one opensearch.test_case.result event (status pass/fail/error,
+duration, and with record_io=True opensearch.test_case.input / .expected /
+.output), both parented to the agent run's root span. At the end it emits one
+opensearch.test_suite_run.result event with the run status and case counts.
+Data Prepper routes all three to the otel-v1-genai-evaluation-* index.
+Pass trace_structure=True to evaluate() to also get the previous
+"test_suite_run" / "test_case" spans.
 
 Usage:
     AGENT_VERSION=v1 python examples/07_benchmarks.py
@@ -57,7 +60,7 @@ PROMPTS = {
 
 @observe(op=Op.CHAT)
 def my_agent(question: str) -> str:
-    """Your agent — instrumented with @observe for tracing."""
+    """Your agent, instrumented with @observe for tracing."""
     enrich(model="gpt-4o-mini", system=PROMPTS.get(AGENT_VERSION, PROMPTS["v1"]))
     return _simulate(question, AGENT_VERSION)
 
@@ -107,7 +110,7 @@ if __name__ == "__main__":
 
     for case in result.cases:
         print(
-            f"  {case.case_id:<10s} {case.status:<6s} "
+            f"  {case.case_id:<10s} {case.status:<6s} trace={case.trace_id} "
             f"correctness={case.scores.get('correctness', 0):.2f} "
             f"has_source={case.scores.get('has_source', 0):.2f}"
         )
