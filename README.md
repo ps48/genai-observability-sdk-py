@@ -116,7 +116,7 @@ invoke_agent qa_pipeline
 │  │      └── chromadb, pinecone, qdrant, ...      │    │
 │  │  LoggerProvider (evaluation events)           │    │
 │  │  └── BatchLogRecordProcessor                  │    │
-│  │      └── OTLPLogExporter (same endpoint/auth) │    │
+│  │      └── OTLPLogExporter (logs endpoint)   │    │
 │  └──────────────────────────────────────────────┘    │
 └───────────────────────┬──────────────────────────────┘
                         │ OTLP (HTTP/gRPC): /v1/traces + /v1/logs
@@ -188,40 +188,62 @@ register(
 
 `AWSSigV4OTLPExporter` is HTTP-only. AWS OSIS does not expose a gRPC endpoint.
 
-**Evaluation events (OTLP logs):** `register()` also creates a `LoggerProvider` with a `BatchLogRecordProcessor` (or `SimpleLogRecordProcessor` with `batch=False`) and an OTLP log exporter on the same endpoint, protocol, headers, and SigV4 settings as traces. The logs URL swaps `/v1/traces` for `/v1/logs`:
+#### Endpoints: traces and evaluation logs
 
-| Traces endpoint | Logs endpoint |
-|---|---|
-| `http://localhost:21890/opentelemetry/v1/traces` (default) | `http://localhost:21890/opentelemetry/v1/logs` |
-| `http://my-collector:4318/v1/traces` | `http://my-collector:4318/v1/logs` |
-| `grpc://localhost:4317` | `grpc://localhost:4317` (logs service) |
-| `AWSSigV4OTLPExporter(endpoint="https://<pipeline>/v1/traces")` | `AWSSigV4OTLPLogExporter` on `https://<pipeline>/v1/logs` |
+Traces and evaluation logs are separate OTLP endpoints. `register()` creates a `TracerProvider` for traces and a `LoggerProvider` (with a `BatchLogRecordProcessor`, or `SimpleLogRecordProcessor` with `batch=False`) for the evaluation events (`gen_ai.evaluation.result`, `opensearch.test_case.result`, `opensearch.test_suite_run.result`). The log exporter uses the same protocol, headers and SigV4 settings as traces. An OTel Collector or Data Prepper serves both paths on one host; AWS OpenSearch Ingestion (OSIS) has one pipeline per signal, so you need a traces pipeline and a logs pipeline.
 
-Logs endpoint priority: `logs_endpoint=`, then derived from `endpoint=`, then `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, then `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/logs`, then derived from `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, then the Data Prepper default. The logs protocol honors `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`.
+**Logs endpoint resolution (priority order):**
+
+1. `logs_endpoint=` parameter: full URL, used as-is
+2. `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` env var: full URL, used as-is
+3. An explicit traces endpoint (`endpoint=`, or the URL of `exporter=AWSSigV4OTLPExporter(...)`): if its path ends with `/v1/traces`, the same base with `/v1/logs`. This is the only derivation. For any other path the SDK logs a warning and skips logs (traces still work).
+4. `OTEL_EXPORTER_OTLP_ENDPOINT` env var: base URL, `/v1/logs` appended (per the OTel spec)
+5. `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` env var: same rule as 3
+6. `http://localhost:21890/opentelemetry/v1/logs`: Data Prepper default
+
+With gRPC traces only 1 and 2 apply; without them the SDK warns and skips logs. A custom `exporter=` other than `AWSSigV4OTLPExporter` also needs `log_exporter=`, else logs are skipped with a warning. The logs protocol honors `protocol=`, then `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` / `OTEL_EXPORTER_OTLP_PROTOCOL`, then the URL scheme.
+
+**Local OTel Collector** (one host, both paths):
+
+```python
+register(
+    endpoint="http://localhost:4318/v1/traces",
+    logs_endpoint="http://localhost:4318/v1/logs",  # optional here: derived from /v1/traces
+    service_name="my-agent",
+)
+```
+
+**AWS OSIS** (two pipeline URLs, SigV4):
+
+```python
+from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
+
+register(
+    exporter=AWSSigV4OTLPExporter(
+        endpoint="https://traces-pipe-abc.us-east-1.osis.amazonaws.com/v1/traces",
+        service="osis",
+    ),
+    logs_endpoint="https://logs-pipe-def.us-east-1.osis.amazonaws.com/v1/logs",
+)
+```
+
+The logs pipeline needs an OTLP logs source; Data Prepper routes the evaluation events to `otel-v1-genai-evaluation-*`. Without `logs_endpoint=` the SDK derives `/v1/logs` on the traces pipeline host, which only works if that pipeline also accepts logs. You can also pass `log_exporter=AWSSigV4OTLPLogExporter(endpoint=..., service="osis")` directly.
+
+**Environment variables only:**
+
+```bash
+export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://traces-pipe-abc.us-east-1.osis.amazonaws.com/v1/traces
+export OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=https://logs-pipe-def.us-east-1.osis.amazonaws.com/v1/logs
+# or, for a collector serving both: export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+```
 
 | Parameter | Default | Description |
 |---|---|---|
 | `enable_logs` | `True` | Set up the logs pipeline for evaluation events |
-| `logs_endpoint` | derived | Full OTLP logs URL, for example a separate OSIS logs pipeline |
+| `logs_endpoint` | resolved | Full OTLP logs URL, for example the OSIS logs pipeline |
 | `log_exporter` | `None` | Custom `LogRecordExporter`. Needed when `exporter=` is a custom exporter other than `AWSSigV4OTLPExporter` |
 
 Existing setups are left alone: if a global `LoggerProvider` is already configured, `register()` does not replace it and `score()` uses yours. With `set_global=False` no logs pipeline is created. The returned `TracerProvider`'s `force_flush()` and `shutdown()` also flush and shut down the logs pipeline, so `provider.force_flush()` before exit covers both signals.
-
-If your OSIS pipeline only accepts traces, point logs at a pipeline with an OTLP logs source:
-
-```python
-from opensearch_genai_observability_sdk_py.exporters import (
-    AWSSigV4OTLPExporter,
-    AWSSigV4OTLPLogExporter,
-)
-
-register(
-    exporter=AWSSigV4OTLPExporter(endpoint="https://traces-pipeline.../v1/traces", service="osis"),
-    log_exporter=AWSSigV4OTLPLogExporter(
-        endpoint="https://logs-pipeline.../v1/logs", service="osis"
-    ),
-)
-```
 
 ### `observe()`
 
@@ -405,13 +427,14 @@ score(
 | `error_type` | `str` | `error.type` | Set when the evaluator itself failed |
 | `judge_trace_id` | `str` | `opensearch.evaluation.judge.trace_id` | Trace of the judge's own run |
 | `attributes` | `dict` | as-is | Extra attributes, e.g. `test.*` grouping keys from [semantic-conventions-genai#79](https://github.com/open-telemetry/semantic-conventions-genai/issues/79) |
-| `carrier` | `str` | | `"event"` (default), `"span"` (deprecated), or `"both"` |
 
 `opensearch.evaluation.*` names are extensions for proposals that have not merged upstream yet; they will move to `gen_ai.*` names when they do.
 
 If you configure OTel yourself instead of calling `register()`, install a global `LoggerProvider` with an OTLP log exporter, otherwise the events are dropped.
 
-**Deprecated span carrier.** Earlier releases recorded each score as a child span `evaluation <name>` (with `gen_ai.operation.name=evaluation`, mirrored `gen_ai.evaluation.*` span attributes, and a span event). That behavior is kept for one release behind `score(..., carrier="span")` or `OPENSEARCH_GENAI_EVAL_CARRIER=span`, and logs a one-time `DeprecationWarning`. Use `carrier="both"` (or `OPENSEARCH_GENAI_EVAL_CARRIER=both`) to emit both while migrating queries and dashboards. In both carriers, trace-level scores no longer derive a root span id from the low 64 bits of the trace id (that linked to a span that does not exist).
+**Instrumentation scope.** Every evaluation event has an instrumentation scope: `evaluator` / `evaluator_version` when given, otherwise `opensearch-genai-observability-sdk-py` with the SDK version. Each SDK logger also sets the scope attributes `opensearch.genai.sdk.name` = `opensearch-genai-observability-sdk-py` and `opensearch.genai.sdk.version` = the SDK version, even when the scope name is your evaluator. Data Prepper and OpenSearch Dashboards derive the grade source (`attributes.derived.evaluation.source = opensearch-sdk`) from the scope.
+
+Trace-level scores never derive a span id from the trace id.
 
 ### `evaluate()`
 
@@ -474,9 +497,7 @@ All three event names are routed by Data Prepper to `otel-v1-genai-evaluation-*`
 - Scorers run outside the agent trace, so a traced LLM judge gets its own trace.
 - `TestCaseResult.status` keeps its historical values (`pass` / `fail`, a task or scorer error is `fail`). New fields: `error_type`, `duration_ms`, and `trace_id` / `span_id` of the span the events are parented to.
 
-Each scorer is the evaluator: a named scorer function sets the event's instrumentation scope and `opensearch.evaluation.evaluator.name`. `EvalScore.label`, `.explanation`, and `.metadata` go on the event.
-
-**Previous span layout.** `trace_structure=True` restores the `test_suite_run <suite>` span with one `test_case <case>` child per case (the task runs inside the case span and the score and case events are parented to it) and still emits the case and run events.
+Each scorer is the evaluator: a named scorer function sets the grade event's instrumentation scope and `opensearch.evaluation.evaluator.name` (lambdas use the SDK scope). Case and run events always use the SDK scope. `EvalScore.label`, `.explanation`, and `.metadata` go on the event.
 
 **Parameters:**
 
@@ -486,9 +507,8 @@ Each scorer is the evaluator: a named scorer function sets the event's instrumen
 | `task` | `Callable` | Function that takes input and returns output. Decorate with `@observe()` for tracing |
 | `data` | `list[dict]` | Dicts with `"input"` and optionally `"expected"`, `"case_id"`, `"case_name"` |
 | `scores` | `list[Callable]` | Scorer functions. Each receives `(input, output, expected)` and returns `EvalScore`, `list[EvalScore]`, or `float` |
-| `metadata` | `dict` | Added to the case and run events (and the root span with `trace_structure=True`). SDK-reserved keys are filtered |
-| `record_io` | `bool` | Record input/output/expected on the case event (and the `test_case` span) as `opensearch.test_case.input` / `.output` / `.expected` (default `False`) |
-| `trace_structure` | `bool` | Also create the `test_suite_run` / `test_case` spans (default `False`) |
+| `metadata` | `dict` | Added to the case and run events. SDK-reserved keys are filtered |
+| `record_io` | `bool` | Record input/output/expected on the case event as `opensearch.test_case.input` / `.output` / `.expected` (default `False`) |
 
 Returns `BenchmarkResult` with `.summary` (aggregate stats) and `.cases` (per-case results).
 
@@ -496,7 +516,7 @@ Returns `BenchmarkResult` with `.summary` (aggregate stats) and `.cases` (per-ca
 
 Upload pre-computed evaluation results from any framework (RAGAS, DeepEval, pytest, custom) as the same events: one `opensearch.test_case.result` event per `log()`, one `gen_ai.evaluation.result` event per score, and one `opensearch.test_suite_run.result` event on `close()`. Use when you already have results and want to visualize them in agent-health or OpenSearch Dashboards.
 
-When `trace_id` / `span_id` of the agent run are given, the case and score events are parented to that span; otherwise they carry no trace context. `log()` also accepts `status` (`pass` / `fail` / `error`; default `error` when `error` is given, else `pass`), `error_type` and `duration_ms`. `Benchmark(..., trace_structure=True)` also creates the previous `test_suite_run` / `test_case` spans. Earlier releases wrote `test.case.input` / `.output` / `.expected` / `.error`; these are now `opensearch.test_case.*` because `test.*` has no such names upstream. `OPENSEARCH_GENAI_EVAL_CARRIER=span` (deprecated) records scores as span events instead.
+When `trace_id` / `span_id` of the agent run are given, the case and score events are parented to that span; otherwise they carry no trace context. `log()` also accepts `status` (`pass` / `fail` / `error`; default `error` when `error` is given, else `pass`), `error_type` and `duration_ms`. `Benchmark` creates no spans. Test case content uses `opensearch.test_case.*` because `test.*` has no such names upstream.
 
 ```python
 from opensearch_genai_observability_sdk_py import Benchmark
@@ -556,7 +576,7 @@ from datetime import datetime
 
 roots = retriever.list_root_spans(services=["my-agent"], since=datetime(2026, 3, 16))
 
-# Check which traces already have evaluation results (events or legacy spans)
+# Check which traces already have evaluation results (gen_ai.evaluation.result events)
 evaluated = retriever.find_evaluated_trace_ids(["trace-id-1", "trace-id-2"])
 ```
 
@@ -576,7 +596,7 @@ evaluated = retriever.find_evaluated_trace_ids(["trace-id-1", "trace-id-2"])
 |---|---|---|
 | `get_traces(identifier, max_spans=10000)` | `SessionRecord` | Fetch spans by conversation ID or trace ID |
 | `list_root_spans(services=None, since=None, max_results=50)` | `list[SpanRecord]` | List recent root spans, optionally filtered by service |
-| `find_evaluated_trace_ids(trace_ids)` | `set[str]` | Return subset of trace IDs that already have evaluation results (evaluation index, plus deprecated evaluation spans) |
+| `find_evaluated_trace_ids(trace_ids)` | `set[str]` | Return subset of trace IDs that already have evaluation results (`gen_ai.evaluation.result` events in the evaluation index) |
 
 Requires the `[opensearch]` extra: `pip install opensearch-genai-observability-sdk-py[opensearch]`
 
@@ -598,12 +618,11 @@ Requires the `[opensearch]` extra: `pip install opensearch-genai-observability-s
 | Environment Variable | Description | Default |
 |---|---|---|
 | `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | Full OTLP traces endpoint URL | — |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base OTLP endpoint URL (`/v1/traces` appended) | — |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Base OTLP endpoint URL (`/v1/traces` and `/v1/logs` appended) | — |
 | `OTEL_EXPORTER_OTLP_TRACES_PROTOCOL` | Protocol for traces (`http/protobuf`, `grpc`) | — |
 | `OTEL_EXPORTER_OTLP_PROTOCOL` | Protocol for all signals (`http/protobuf`, `grpc`) | — |
-| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Full OTLP logs endpoint URL (evaluation events) | derived from traces |
+| `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` | Full OTLP logs endpoint URL (evaluation events), e.g. the OSIS logs pipeline | see [Endpoints](#endpoints-traces-and-evaluation-logs) |
 | `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL` | Protocol for logs (`http/protobuf`, `grpc`) | as traces |
-| `OPENSEARCH_GENAI_EVAL_CARRIER` | `event`, `span` (deprecated), or `both` | `event` |
 | `OTEL_SERVICE_NAME` | Service name for spans | `"default"` |
 | `OPENSEARCH_PROJECT` | Project/service name (fallback) | `"default"` |
 | `AWS_DEFAULT_REGION` | AWS region for SigV4 signing | auto-detected |

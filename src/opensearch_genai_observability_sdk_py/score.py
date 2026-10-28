@@ -26,53 +26,43 @@ Scoring levels:
 - **Session-level:** ``conversation_id`` (``gen_ai.conversation.id``) with
   ``level="session"``.
 
-The previous carrier (a child ``evaluation <name>`` span with mirrored span
-attributes and a span event) is deprecated. It is still available for one
-release with ``carrier="span"`` or ``OPENSEARCH_GENAI_EVAL_CARRIER=span``;
-``carrier="both"`` emits both for migration.
+The instrumentation scope of every event is the evaluator identity
+(``evaluator`` / ``evaluator_version``), or the SDK scope
+(``opensearch-genai-observability-sdk-py`` and the SDK version) when no
+evaluator is named. The scope also carries the attributes
+``opensearch.genai.sdk.name`` / ``opensearch.genai.sdk.version``. Data
+Prepper and OpenSearch Dashboards derive the grade source from the scope.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
-import warnings
-from typing import Any, Literal
+from typing import Any
 
-from opentelemetry import _logs, trace
+from opentelemetry import trace
 from opentelemetry._logs import SeverityNumber
 from opentelemetry.context import Context
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 from opensearch_genai_observability_sdk_py._internal import (
-    SDK_SCOPE_NAME,
-    SDK_VERSION,
+    get_event_logger,
     parse_hex,
 )
 
 logger = logging.getLogger(__name__)
 
-_TRACER_NAME = "opensearch-genai-observability-sdk-py-scores"
-
 EVALUATION_EVENT_NAME = "gen_ai.evaluation.result"
-CARRIER_ENV_VAR = "OPENSEARCH_GENAI_EVAL_CARRIER"
 
-# Safety cap for ``gen_ai.evaluation.explanation`` on the event carrier.
-# Judge rationales are kept whole up to this many characters; longer values
-# are cut and end with ``_TRUNCATION_MARKER``.
+# Safety cap for ``gen_ai.evaluation.explanation``. Judge rationales are kept
+# whole up to this many characters; longer values are cut and end with
+# ``_TRUNCATION_MARKER``.
 EXPLANATION_MAX_CHARS = 8192
-# The deprecated span carrier keeps its historical 500 character limit.
-_SPAN_CARRIER_EXPLANATION_MAX_CHARS = 500
 _TRUNCATION_MARKER = "...[truncated]"
 
-Carrier = Literal["event", "span", "both"]
-_VALID_CARRIERS = ("event", "span", "both")
 _VALID_LEVELS = ("span", "trace", "session", "tool_call")
 _VALID_EVALUATOR_TYPES = ("llm_judge", "code", "human", "external")
 _VALID_DIRECTIONS = ("maximize", "minimize")
-
-_span_carrier_warned = False
 
 
 def _no_span_context() -> Context:
@@ -105,7 +95,6 @@ def score(
     agent_name: str | None = None,
     error_type: str | None = None,
     judge_trace_id: str | None = None,
-    carrier: Carrier | None = None,
 ) -> None:
     """Record an evaluation result as a ``gen_ai.evaluation.result`` event.
 
@@ -119,8 +108,10 @@ def score(
     - ``trace_id`` only: no span context; ``opensearch.evaluation.trace_id``
       holds the target trace and the level defaults to ``trace``.
 
-    The instrumentation scope is the evaluator identity: ``evaluator`` /
-    ``evaluator_version`` when given, otherwise the SDK name and version.
+    The instrumentation scope is always set: ``evaluator`` /
+    ``evaluator_version`` when given, otherwise the SDK scope
+    ``opensearch-genai-observability-sdk-py`` with the SDK version. Data
+    Prepper and OpenSearch Dashboards derive the grade source from it.
 
     ``register()`` configures the OTLP logs pipeline. With your own OTel
     setup, configure a global ``LoggerProvider`` or the events are dropped.
@@ -144,8 +135,7 @@ def score(
             trace-level (no span id is ever derived from the trace id).
         label: Low-cardinality label (e.g., ``"pass"``, ``"relevant"``).
         explanation: Evaluator rationale. Kept whole up to
-            ``EXPLANATION_MAX_CHARS`` (8192) characters on the event; the
-            deprecated span carrier still truncates at 500.
+            ``EXPLANATION_MAX_CHARS`` (8192) characters.
         response_id: Completion ID of the evaluated LLM response.
         attributes: Extra attributes added as-is (e.g., ``test.*`` grouping
             keys from semantic-conventions-genai#79).
@@ -162,8 +152,6 @@ def score(
         agent_name: ``gen_ai.agent.name`` of the evaluated agent.
         error_type: ``error.type`` when the evaluator itself failed.
         judge_trace_id: Trace id of the judge's own run, if traced.
-        carrier: ``"event"`` (default), ``"span"`` (deprecated) or ``"both"``.
-            When omitted, ``OPENSEARCH_GENAI_EVAL_CARRIER`` is honored.
 
     Examples:
         # Inline: score the active span
@@ -194,8 +182,6 @@ def score(
             attributes={"test.suite.run.id": "run_001", "test.case.id": "case_001"},
         )
     """
-    resolved_carrier = resolve_carrier(carrier)
-
     ctx, has_span, target_trace_id = _resolve_target(trace_id, span_id)
 
     resolved_level = level
@@ -207,10 +193,11 @@ def score(
         elif conversation_id:
             resolved_level = "session"
 
-    common: dict[str, Any] = dict(
+    event_attrs = build_evaluation_attributes(
         name=name,
         value=value,
         label=label,
+        explanation=explanation,
         response_id=response_id,
         level=resolved_level,
         evaluator=evaluator,
@@ -226,71 +213,18 @@ def score(
         target_trace_id=target_trace_id,
         extra=attributes,
     )
-
-    if resolved_carrier in ("event", "both"):
-        event_attrs = build_evaluation_attributes(
-            explanation=explanation, explanation_limit=EXPLANATION_MAX_CHARS, **common
-        )
-        emit_evaluation_event(
-            event_attrs,
-            context=ctx,
-            evaluator=evaluator,
-            evaluator_version=evaluator_version,
-        )
-
-    if resolved_carrier in ("span", "both"):
-        warn_span_carrier_deprecated()
-        span_attrs = build_evaluation_attributes(
-            explanation=explanation,
-            explanation_limit=_SPAN_CARRIER_EXPLANATION_MAX_CHARS,
-            **common,
-        )
-        _emit_score_span(name, span_attrs, ctx)
-
-    logger.debug(
-        "Score emitted: %s=%s (trace=%s, carrier=%s)", name, value, trace_id, resolved_carrier
+    emit_evaluation_event(
+        event_attrs,
+        context=ctx,
+        evaluator=evaluator,
+        evaluator_version=evaluator_version,
     )
+    logger.debug("Score emitted: %s=%s (trace=%s)", name, value, trace_id)
 
 
 # ---------------------------------------------------------------------------
 # Shared helpers (also used by benchmark.py)
 # ---------------------------------------------------------------------------
-
-
-def resolve_carrier(carrier: str | None) -> str:
-    """Resolve the carrier from the argument or ``OPENSEARCH_GENAI_EVAL_CARRIER``."""
-    if carrier is not None:
-        if carrier not in _VALID_CARRIERS:
-            raise ValueError(
-                f"Unknown carrier {carrier!r}. Use one of: {', '.join(_VALID_CARRIERS)}."
-            )
-        return carrier
-
-    env = os.environ.get(CARRIER_ENV_VAR, "").strip().lower()
-    if not env:
-        return "event"
-    if env not in _VALID_CARRIERS:
-        logger.warning(
-            "%s=%r is not one of %s; using 'event'", CARRIER_ENV_VAR, env, _VALID_CARRIERS
-        )
-        return "event"
-    return env
-
-
-def warn_span_carrier_deprecated() -> None:
-    """Emit the span-carrier ``DeprecationWarning`` once per process."""
-    global _span_carrier_warned
-    if _span_carrier_warned:
-        return
-    _span_carrier_warned = True
-    warnings.warn(
-        "The span carrier for evaluation results (carrier='span' or "
-        f"{CARRIER_ENV_VAR}=span) is deprecated and will be removed in a future "
-        "release. Evaluation results are now emitted as gen_ai.evaluation.result "
-        "log events (carrier='event').",
-        DeprecationWarning,
-        stacklevel=3,
-    )
 
 
 def build_evaluation_attributes(
@@ -299,7 +233,6 @@ def build_evaluation_attributes(
     value: float | None = None,
     label: str | None = None,
     explanation: str | None = None,
-    explanation_limit: int = EXPLANATION_MAX_CHARS,
     response_id: str | None = None,
     level: str | None = None,
     evaluator: str | None = None,
@@ -326,7 +259,7 @@ def build_evaluation_attributes(
     if label:
         attrs["gen_ai.evaluation.score.label"] = label
     if explanation:
-        attrs["gen_ai.evaluation.explanation"] = _truncate(explanation, explanation_limit)
+        attrs["gen_ai.evaluation.explanation"] = _truncate(explanation, EXPLANATION_MAX_CHARS)
     if response_id:
         attrs["gen_ai.response.id"] = response_id
     if error_type:
@@ -369,13 +302,10 @@ def emit_evaluation_event(
 
     ``context`` carries the evaluated span (``None`` means the current
     context, i.e. the active span). The scope is the evaluator identity, or
-    the SDK scope when no evaluator is named.
+    the SDK scope when no evaluator is named, and always carries the
+    ``opensearch.genai.sdk.name`` / ``.version`` scope attributes.
     """
-    if evaluator:
-        scope_name, scope_version = evaluator, evaluator_version or ""
-    else:
-        scope_name, scope_version = SDK_SCOPE_NAME, SDK_VERSION or ""
-    otel_logger = _logs.get_logger(scope_name, scope_version)
+    otel_logger = get_event_logger(evaluator, evaluator_version)
     otel_logger.emit(
         event_name=EVALUATION_EVENT_NAME,
         timestamp=time.time_ns(),
@@ -416,7 +346,7 @@ def _resolve_target(
 
     Returns ``(context, has_span, target_trace_id)``:
 
-    - ``context`` is passed to ``Logger.emit`` / used as the span parent.
+    - ``context`` is passed to ``Logger.emit``.
       ``None`` means "use the current context" (the active span).
       ``_no_span_context()`` means "no span context at all".
     - ``has_span`` is ``True`` when the context carries a valid span.
@@ -447,18 +377,6 @@ def _resolve_target(
     # Trace-level: never invent a span id. Emit with a span-less context so the
     # active span (if any) is not picked up, and carry the target trace id.
     return _no_span_context(), False, normalized_trace_id
-
-
-def _emit_score_span(name: str, attrs: dict[str, Any], ctx: Context | None) -> None:
-    """Deprecated span carrier: child span ``evaluation <name>`` plus a span event."""
-    tracer = trace.get_tracer(_TRACER_NAME)
-    span_attrs: dict[str, Any] = {"gen_ai.operation.name": "evaluation", **attrs}
-    with tracer.start_as_current_span(
-        f"evaluation {name}",
-        context=ctx,
-        attributes=span_attrs,
-    ) as span:
-        span.add_event(EVALUATION_EVENT_NAME, attributes=attrs)
 
 
 def _truncate(value: str, limit: int) -> str:

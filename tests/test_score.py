@@ -9,9 +9,6 @@
 
 """Tests for opensearch_genai_observability_sdk_py.score."""
 
-import importlib
-import warnings
-
 import pytest
 from opentelemetry import trace
 from opentelemetry._logs import SeverityNumber
@@ -20,21 +17,8 @@ from opensearch_genai_observability_sdk_py._internal import SDK_SCOPE_NAME, SDK_
 from opensearch_genai_observability_sdk_py._internal import parse_hex as _parse_hex
 from opensearch_genai_observability_sdk_py.score import EXPLANATION_MAX_CHARS, score
 
-_score_mod = importlib.import_module("opensearch_genai_observability_sdk_py.score")
-
 TRACE_ID = "6ebb9835f43af1552f2cebb9f5165e39"
 SPAN_ID = "89829115c2128845"
-
-
-@pytest.fixture(autouse=True)
-def _reset_carrier(monkeypatch):
-    """Isolate tests from the carrier env var and the one-time warning flag."""
-    monkeypatch.delenv("OPENSEARCH_GENAI_EVAL_CARRIER", raising=False)
-    monkeypatch.setattr(_score_mod, "_span_carrier_warned", False)
-    # Span-carrier tests trigger the DeprecationWarning; keep output quiet.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", DeprecationWarning)
-        yield
 
 
 def _one_event(eval_events):
@@ -49,7 +33,7 @@ def _ids(record):
 
 
 # ---------------------------------------------------------------------------
-# Event carrier (default): gen_ai.evaluation.result log record
+# gen_ai.evaluation.result log record
 # ---------------------------------------------------------------------------
 
 
@@ -88,13 +72,21 @@ class TestEventEmission:
         score(name="relevance", value=0.9)
         scope = _one_event(eval_events).instrumentation_scope
         assert scope.name == SDK_SCOPE_NAME == "opensearch-genai-observability-sdk-py"
-        assert scope.version == (SDK_VERSION or "")
+        assert scope.version == SDK_VERSION
+        assert scope.version
+        assert dict(scope.attributes) == {
+            "opensearch.genai.sdk.name": "opensearch-genai-observability-sdk-py",
+            "opensearch.genai.sdk.version": SDK_VERSION,
+        }
 
     def test_evaluator_is_scope(self, eval_events):
         score(name="relevance", value=0.9, evaluator="relevance_judge", evaluator_version="3.1")
         rec = _one_event(eval_events)
         assert rec.instrumentation_scope.name == "relevance_judge"
         assert rec.instrumentation_scope.version == "3.1"
+        # The SDK identity is still on the scope as attributes
+        assert rec.instrumentation_scope.attributes["opensearch.genai.sdk.name"] == SDK_SCOPE_NAME
+        assert rec.instrumentation_scope.attributes["opensearch.genai.sdk.version"] == SDK_VERSION
         assert (
             rec.log_record.attributes["opensearch.evaluation.evaluator.name"] == "relevance_judge"
         )
@@ -302,132 +294,29 @@ class TestEventAttributes:
 
 
 # ---------------------------------------------------------------------------
-# Carrier selection and the deprecated span carrier
+# No span carrier
 # ---------------------------------------------------------------------------
 
 
-class TestCarrierSelection:
-    def test_invalid_carrier_raises(self):
-        with pytest.raises(ValueError, match="Unknown carrier"):
-            score(name="t", carrier="kafka")  # type: ignore[arg-type]
+class TestNoSpanCarrier:
+    def test_carrier_parameter_removed(self):
+        with pytest.raises(TypeError):
+            score(name="t", carrier="span")  # type: ignore[call-arg]
 
-    def test_env_var_span(self, monkeypatch, exporter, eval_events):
+    def test_legacy_env_var_ignored(self, monkeypatch, exporter, eval_events):
         monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "span")
-        score(name="t", value=0.5)
-        assert len(exporter.get_finished_spans()) == 1
-        assert eval_events() == []
-
-    def test_env_var_both(self, monkeypatch, exporter, eval_events):
-        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "BOTH")
-        score(name="t", value=0.5)
-        assert len(exporter.get_finished_spans()) == 1
-        assert len(eval_events()) == 1
-
-    def test_env_var_invalid_uses_event(self, monkeypatch, exporter, eval_events):
-        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "nope")
-        score(name="t", value=0.5)
+        score(name="t", value=0.5, trace_id=TRACE_ID, span_id=SPAN_ID)
         assert exporter.get_finished_spans() == ()
         assert len(eval_events()) == 1
 
-    def test_param_overrides_env(self, monkeypatch, exporter, eval_events):
-        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "span")
-        score(name="t", value=0.5, carrier="event")
-        assert exporter.get_finished_spans() == ()
+    def test_active_span_gets_no_child_or_event(self, exporter, eval_events):
+        tracer = trace.get_tracer("test")
+        with tracer.start_as_current_span("chat"):
+            score(name="t", value=0.5)
+        spans = exporter.get_finished_spans()
+        assert [s.name for s in spans] == ["chat"]
+        assert spans[0].events == ()
         assert len(eval_events()) == 1
-
-    def test_both_emits_event_and_span(self, exporter, eval_events):
-        score(name="t", value=0.5, trace_id=TRACE_ID, span_id=SPAN_ID, carrier="both")
-        span = exporter.get_finished_spans()[0]
-        rec = _one_event(eval_events)
-        # The event is parented to the evaluated span, not the score span.
-        assert _ids(rec) == (TRACE_ID, SPAN_ID)
-        assert format(span.parent.span_id, "016x") == SPAN_ID
-
-    def test_both_with_active_span_parents_event_to_evaluated_span(self, exporter, eval_events):
-        tracer = trace.get_tracer("test")
-        with tracer.start_as_current_span("chat") as evaluated:
-            score(name="t", value=0.5, carrier="both")
-            sc = evaluated.get_span_context()
-        rec = _one_event(eval_events)
-        assert rec.log_record.span_id == sc.span_id
-
-    def test_deprecation_warning_once(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            score(name="a", carrier="span")
-            score(name="b", carrier="span")
-            score(name="c", carrier="both")
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecations) == 1
-        assert "deprecated" in str(deprecations[0].message)
-
-    def test_deprecation_warning_from_env(self, monkeypatch):
-        monkeypatch.setenv("OPENSEARCH_GENAI_EVAL_CARRIER", "span")
-        with pytest.warns(DeprecationWarning, match="span carrier"):
-            score(name="a")
-
-    def test_no_warning_for_event_carrier(self):
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            score(name="a")
-        assert not [w for w in caught if issubclass(w.category, DeprecationWarning)]
-
-
-class TestSpanCarrier:
-    def test_span_name_and_operation(self, exporter):
-        score(name="relevance", value=0.9, carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert span.name == "evaluation relevance"
-        assert span.attributes["gen_ai.operation.name"] == "evaluation"
-        assert span.attributes["gen_ai.evaluation.name"] == "relevance"
-        assert span.attributes["gen_ai.evaluation.score.value"] == 0.9
-
-    def test_span_event(self, exporter):
-        score(name="helpfulness", value=0.83, label="ok", response_id="r1", carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert len(span.events) == 1
-        event = span.events[0]
-        assert event.name == "gen_ai.evaluation.result"
-        assert event.attributes["gen_ai.evaluation.score.label"] == "ok"
-        assert event.attributes["gen_ai.response.id"] == "r1"
-
-    def test_span_level_parent(self, exporter):
-        score(name="accuracy", value=0.95, trace_id=TRACE_ID, span_id=SPAN_ID, carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert format(span.context.trace_id, "032x") == TRACE_ID
-        assert format(span.parent.span_id, "016x") == SPAN_ID
-
-    def test_trace_level_no_derived_parent(self, exporter):
-        """Regression: the span carrier no longer invents a root span id."""
-        score(name="relevance", value=0.92, trace_id=TRACE_ID, carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert span.parent is None
-        assert span.attributes["opensearch.evaluation.trace_id"] == TRACE_ID
-        assert span.attributes["opensearch.evaluation.level"] == "trace"
-
-    def test_active_span_parent(self, exporter):
-        tracer = trace.get_tracer("test")
-        with tracer.start_as_current_span("chat") as evaluated:
-            score(name="t", carrier="span")
-            sc = evaluated.get_span_context()
-        score_span = next(s for s in exporter.get_finished_spans() if s.name == "evaluation t")
-        assert score_span.parent.span_id == sc.span_id
-
-    def test_explanation_truncated_at_500(self, exporter):
-        score(name="t", explanation="x" * 1000, carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert len(span.attributes["gen_ai.evaluation.explanation"]) == 500
-
-    def test_new_attributes_mirrored(self, exporter):
-        score(name="t", evaluator="j", evaluator_type="code", carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert span.attributes["opensearch.evaluation.evaluator.name"] == "j"
-        assert span.attributes["opensearch.evaluation.evaluator.type"] == "code"
-
-    def test_attributes_passthrough(self, exporter):
-        score(name="t", attributes={"test.case.id": "c1"}, carrier="span")
-        span = exporter.get_finished_spans()[0]
-        assert span.attributes["test.case.id"] == "c1"
 
 
 # ---------------------------------------------------------------------------

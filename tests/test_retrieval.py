@@ -442,41 +442,35 @@ class TestFindEvaluatedTraceIds:
             r._mock_client = mock_cls.return_value
             return r
 
-    def test_returns_evaluated_ids(self, retriever):
-        retriever._mock_client.search.return_value = {
-            "aggregations": {"evaluated": {"buckets": [{"key": "t1"}, {"key": "t3"}]}}
-        }
-        result = retriever.find_evaluated_trace_ids(["t1", "t2", "t3"])
-        assert result == {"t1", "t3"}
-
     def test_empty_input(self, retriever):
         assert retriever.find_evaluated_trace_ids([]) == set()
+        retriever._mock_client.search.assert_not_called()
 
     def test_event_results_from_evaluation_index(self, retriever):
-        retriever._mock_client.search.side_effect = [
-            {
-                "aggregations": {
-                    "by_trace": {"buckets": [{"key": "t1"}]},
-                    "by_target": {"buckets": [{"key": "t2"}, {"key": "other"}]},
-                }
-            },
-            {"aggregations": {"evaluated": {"buckets": []}}},
-        ]
+        retriever._mock_client.search.return_value = {
+            "aggregations": {
+                "by_trace": {"buckets": [{"key": "t1"}]},
+                "by_target": {"buckets": [{"key": "t2"}, {"key": "other"}]},
+            }
+        }
         assert retriever.find_evaluated_trace_ids(["t1", "t2", "t3"]) == {"t1", "t2"}
-        first = retriever._mock_client.search.call_args_list[0]
-        assert first.kwargs["index"] == "otel-v1-genai-evaluation*"
-        assert first.kwargs["ignore_unavailable"] is True
+        # One query, against the evaluation index only (no span fallback)
+        assert retriever._mock_client.search.call_count == 1
+        call = retriever._mock_client.search.call_args
+        assert call.kwargs["index"] == "otel-v1-genai-evaluation*"
+        assert call.kwargs["ignore_unavailable"] is True
 
-    def test_evaluation_index_failure_falls_back_to_spans(self, retriever):
-        retriever._mock_client.search.side_effect = [
-            RuntimeError("index_not_found"),
-            {"aggregations": {"evaluated": {"buckets": [{"key": "t3"}]}}},
-        ]
-        assert retriever.find_evaluated_trace_ids(["t1", "t3"]) == {"t3"}
+    def test_only_grade_events_count(self, retriever):
+        """Test case / run events in the same index are not evaluation results."""
+        retriever._mock_client.search.return_value = {"aggregations": {}}
+        retriever.find_evaluated_trace_ids(["t1"])
+        query = retriever._mock_client.search.call_args.kwargs["body"]["query"]["bool"]
+        assert {"term": {"eventName": "gen_ai.evaluation.result"}} in query["filter"]
+
+    def test_evaluation_index_failure_returns_empty(self, retriever):
+        retriever._mock_client.search.side_effect = RuntimeError("index_not_found")
+        assert retriever.find_evaluated_trace_ids(["t1", "t3"]) == set()
 
     def test_none_evaluated(self, retriever):
-        retriever._mock_client.search.return_value = {
-            "aggregations": {"evaluated": {"buckets": []}}
-        }
-        result = retriever.find_evaluated_trace_ids(["t1", "t2"])
-        assert result == set()
+        retriever._mock_client.search.return_value = {"aggregations": {}}
+        assert retriever.find_evaluated_trace_ids(["t1", "t2"]) == set()

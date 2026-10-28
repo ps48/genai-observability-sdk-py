@@ -18,8 +18,7 @@ gen_ai.evaluation.result event per score; closing the Benchmark emits one
 opensearch.test_suite_run.result event with the run status and case counts.
 All are exported to /v1/logs and indexed in otel-v1-genai-evaluation-*. With
 trace_id/span_id the case and score events are parented to that agent span;
-without them they carry no trace context. Benchmark(..., trace_structure=True)
-also creates the previous "test_suite_run" / "test_case" spans.
+without them they carry no trace context. Benchmark creates no spans.
 
 Three patterns:
     A. Upload from a list of dicts (any eval framework)

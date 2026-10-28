@@ -11,8 +11,9 @@
 
 Provides drop-in replacements for OTLPSpanExporter and OTLPLogExporter that
 sign requests using AWS Signature Version 4 for AWS-hosted OpenSearch
-and Data Prepper endpoints. The log exporter carries the
-``gen_ai.evaluation.result`` events emitted by ``score()``.
+and Data Prepper endpoints. The log exporter carries the evaluation events
+(``gen_ai.evaluation.result`` and the test case / run events). AWS OSIS
+needs a separate logs pipeline for them.
 
 Design note
 -----------
@@ -153,13 +154,24 @@ class AWSSigV4OTLPExporter(OTLPSpanExporter):
     def create_log_exporter(self, endpoint: str | None = None) -> AWSSigV4OTLPLogExporter:
         """Create a SigV4 log exporter with the same service and region.
 
+        AWS OSIS has one pipeline per signal, so pass the logs pipeline URL.
+
         Args:
-            endpoint: OTLP logs URL. Defaults to this exporter's endpoint with
-                ``/v1/traces`` swapped for ``/v1/logs``. Pipelines whose source
-                only accepts traces need a separate logs pipeline URL here.
+            endpoint: OTLP logs URL (the OSIS logs pipeline). When omitted,
+                derived from this exporter's endpoint only if it ends with
+                ``/v1/traces`` (same base, ``/v1/logs``).
+
+        Raises:
+            ValueError: If ``endpoint`` is omitted and cannot be derived.
         """
+        resolved = endpoint or derive_logs_endpoint(self.endpoint)
+        if not resolved:
+            raise ValueError(
+                f"Cannot derive an OTLP logs endpoint from '{self.endpoint}' (no /v1/traces "
+                "suffix). Pass endpoint= with the logs pipeline URL."
+            )
         return AWSSigV4OTLPLogExporter(
-            endpoint=endpoint or derive_logs_endpoint(self.endpoint),
+            endpoint=resolved,
             service=self.service,
             region=self.region,
         )

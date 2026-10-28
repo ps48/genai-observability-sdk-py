@@ -18,6 +18,8 @@ import logging
 from importlib.metadata import PackageNotFoundError, version
 from urllib.parse import urlparse, urlunparse
 
+from opentelemetry import _logs
+
 logger = logging.getLogger(__name__)
 
 # Instrumentation scope used when the SDK itself emits telemetry (for
@@ -25,9 +27,42 @@ logger = logging.getLogger(__name__)
 SDK_SCOPE_NAME = "opensearch-genai-observability-sdk-py"
 
 try:
-    SDK_VERSION: str | None = version(SDK_SCOPE_NAME)
+    SDK_VERSION: str = version(SDK_SCOPE_NAME)
 except PackageNotFoundError:  # pragma: no cover - only when running from a bare checkout
-    SDK_VERSION = None
+    SDK_VERSION = "0.0.0+unknown"
+
+
+# Instrumentation scope attributes set on every logger the SDK uses for
+# evaluation, test case and test suite run events. Data Prepper derives
+# ``derived.evaluation.source = opensearch-sdk`` from them, even when the scope
+# name is a user-named evaluator.
+SDK_SCOPE_ATTRIBUTES: dict[str, str] = {
+    "opensearch.genai.sdk.name": SDK_SCOPE_NAME,
+    "opensearch.genai.sdk.version": SDK_VERSION,
+}
+
+
+def event_scope(
+    evaluator: str | None = None, evaluator_version: str | None = None
+) -> tuple[str, str]:
+    """Instrumentation scope ``(name, version)`` for an SDK-emitted event.
+
+    The evaluator identity when an evaluator is named, otherwise the SDK
+    scope. Data Prepper and OpenSearch Dashboards derive the grade source
+    from the scope, so it is always set.
+    """
+    if evaluator:
+        return evaluator, evaluator_version or ""
+    return SDK_SCOPE_NAME, SDK_VERSION
+
+
+def get_event_logger(
+    evaluator: str | None = None, evaluator_version: str | None = None
+) -> _logs.Logger:
+    """OTel Logger for SDK events: ``event_scope()`` plus ``SDK_SCOPE_ATTRIBUTES``."""
+    name, scope_version = event_scope(evaluator, evaluator_version)
+    return _logs.get_logger(name, scope_version, attributes=SDK_SCOPE_ATTRIBUTES)
+
 
 # Exact attribute keys written by the SDK — user metadata must not use these.
 _RESERVED_KEYS = frozenset(
@@ -38,21 +73,15 @@ _RESERVED_KEYS = frozenset(
         "test.case.id",
         "test.case.name",
         "test.case.result.status",
-        "test.case.error",
-        "test.case.input",
-        "test.case.output",
-        "test.case.expected",
         "opensearch.test_case.input",
         "opensearch.test_case.output",
         "opensearch.test_case.expected",
-        "opensearch.test_case.error",
         "opensearch.test_case.duration_ms",
         "opensearch.test_suite_run.case_count",
         "opensearch.test_suite_run.pass_count",
         "opensearch.test_suite_run.fail_count",
         "opensearch.test_suite_run.error_count",
         "opensearch.test_suite_run.duration_ms",
-        "gen_ai.operation.name",
     }
 )
 
@@ -79,36 +108,23 @@ def validate_metadata_keys(metadata: dict, *, context: str = "") -> None:
             )
 
 
-def derive_logs_endpoint(traces_endpoint: str) -> str:
-    """Derive the OTLP logs endpoint from an OTLP traces endpoint.
+def derive_logs_endpoint(traces_endpoint: str) -> str | None:
+    """Derive the OTLP logs endpoint from an OTLP traces endpoint, if possible.
 
-    Mirrors how the traces endpoint is built: the trailing ``/v1/traces``
-    (or ``/traces``) signal path is swapped for ``/v1/logs`` (or ``/logs``),
-    keeping scheme, host, port and any path prefix (for example
-    ``/opentelemetry`` for Data Prepper). gRPC endpoints carry no signal path
-    and are returned unchanged.
+    This is the only derivation the SDK does: a traces URL whose path ends
+    with ``/v1/traces`` maps to the same base with ``/v1/logs`` (scheme,
+    host, port and any path prefix such as ``/opentelemetry`` are kept).
+    Any other path returns ``None``: the SDK does not guess.
 
     Examples::
 
         http://localhost:4318/v1/traces                  -> http://localhost:4318/v1/logs
         http://localhost:21890/opentelemetry/v1/traces   -> .../opentelemetry/v1/logs
         https://x.us-east-1.osis.amazonaws.com/v1/traces -> .../v1/logs
-        grpc://localhost:4317                            -> grpc://localhost:4317
+        http://collector:4318/custom                     -> None
     """
     parsed = urlparse(traces_endpoint)
-    if parsed.scheme.lower() in ("grpc", "grpcs"):
-        return traces_endpoint
-
     path = parsed.path.rstrip("/")
-    if path.endswith("/traces"):
-        new_path = path[: -len("traces")] + "logs"
-    elif path == "":
-        new_path = "/v1/logs"
-    else:
-        logger.warning(
-            "Cannot derive an OTLP logs endpoint from '%s' (no /v1/traces suffix); "
-            "appending /v1/logs. Pass logs_endpoint= to override.",
-            traces_endpoint,
-        )
-        new_path = path + "/v1/logs"
-    return urlunparse(parsed._replace(path=new_path))
+    if not path.endswith("/v1/traces"):
+        return None
+    return urlunparse(parsed._replace(path=path[: -len("/v1/traces")] + "/v1/logs"))

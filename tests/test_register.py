@@ -306,9 +306,6 @@ class TestDeriveLogsEndpoint:
                 "https://p-abc.us-east-1.osis.amazonaws.com/v1/traces",
                 "https://p-abc.us-east-1.osis.amazonaws.com/v1/logs",
             ),
-            ("http://collector:4318", "http://collector:4318/v1/logs"),
-            ("grpc://localhost:4317", "grpc://localhost:4317"),
-            ("grpcs://collector:4317", "grpcs://collector:4317"),
         ],
     )
     def test_derivation(self, traces, logs):
@@ -316,11 +313,19 @@ class TestDeriveLogsEndpoint:
 
         assert derive_logs_endpoint(traces) == logs
 
-    def test_unknown_path_warns(self, caplog):
+    @pytest.mark.parametrize(
+        "traces",
+        [
+            "http://collector:4318",
+            "http://h:1/custom",
+            "http://h:1/traces",
+            "https://p.osis.amazonaws.com/ingest",
+        ],
+    )
+    def test_no_guessing(self, traces):
         from opensearch_genai_observability_sdk_py._internal import derive_logs_endpoint
 
-        assert derive_logs_endpoint("http://h:1/custom") == "http://h:1/custom/v1/logs"
-        assert "Cannot derive" in caplog.text
+        assert derive_logs_endpoint(traces) is None
 
 
 class TestResolveLogsEndpoint:
@@ -331,11 +336,41 @@ class TestResolveLogsEndpoint:
             == "http://p/v1/logs"
         )
 
-    def test_derived_from_endpoint_param(self, clean_otlp_env, monkeypatch):
+    def test_logs_env_beats_derivation(self, clean_otlp_env, monkeypatch):
         monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://env:4318/v1/logs")
         assert (
             _register_mod._resolve_logs_endpoint("http://x:4318/v1/traces", None)
+            == "http://env:4318/v1/logs"
+        )
+
+    def test_derived_from_endpoint_param(self, clean_otlp_env, monkeypatch):
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://base:4318")
+        assert (
+            _register_mod._resolve_logs_endpoint("http://x:4318/v1/traces", None)
             == "http://x:4318/v1/logs"
+        )
+
+    def test_endpoint_param_without_traces_suffix_skips(self, clean_otlp_env, caplog):
+        assert _register_mod._resolve_logs_endpoint("http://x:4318/ingest", None) is None
+        assert "cannot derive an OTLP logs endpoint" in caplog.text
+        assert "logs_endpoint=" in caplog.text
+
+    def test_grpc_without_logs_endpoint_skips(self, clean_otlp_env, monkeypatch, caplog):
+        assert _register_mod._resolve_logs_endpoint("grpc://localhost:4317", None) is None
+        assert "gRPC" in caplog.text
+        assert _register_mod._resolve_logs_endpoint("http://localhost:4317", None, "grpc") is None
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://base:4317")
+        assert _register_mod._resolve_logs_endpoint(None, None, "grpc") is None
+
+    def test_grpc_with_logs_endpoint(self, clean_otlp_env, monkeypatch):
+        assert (
+            _register_mod._resolve_logs_endpoint("grpc://localhost:4317", "grpc://localhost:4317")
+            == "grpc://localhost:4317"
+        )
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://l:4318/v1/logs")
+        assert (
+            _register_mod._resolve_logs_endpoint("grpc://localhost:4317", None)
+            == "http://l:4318/v1/logs"
         )
 
     def test_logs_env(self, clean_otlp_env, monkeypatch):
@@ -351,6 +386,11 @@ class TestResolveLogsEndpoint:
     def test_derived_from_traces_env(self, clean_otlp_env, monkeypatch):
         monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://t:4318/v1/traces")
         assert _register_mod._resolve_logs_endpoint(None, None) == "http://t:4318/v1/logs"
+
+    def test_traces_env_without_suffix_skips(self, clean_otlp_env, monkeypatch, caplog):
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://t:4318/custom")
+        assert _register_mod._resolve_logs_endpoint(None, None) is None
+        assert "cannot derive" in caplog.text
 
     def test_default(self, clean_otlp_env):
         assert _register_mod._resolve_logs_endpoint(None, None) == (
@@ -424,8 +464,26 @@ class TestRegisterLogs:
 
         mock_grpc.return_value = MagicMock()
         mock_log.return_value = _in_memory_log_exporter()
-        register(endpoint="http://localhost:4317", protocol="grpc", auto_instrument=False)
+        register(
+            endpoint="http://localhost:4317",
+            logs_endpoint="http://localhost:4317",
+            protocol="grpc",
+            auto_instrument=False,
+        )
         assert mock_log.call_args.kwargs["protocol"] == "grpc"
+
+    @patch.object(_register_mod, "_create_log_exporter")
+    @patch.object(_register_mod, "_create_grpc_exporter")
+    def test_grpc_without_logs_endpoint_skips_logs(
+        self, mock_grpc, mock_log, fresh_globals, clean_otlp_env, caplog
+    ):
+        from opensearch_genai_observability_sdk_py.register import register
+
+        mock_grpc.return_value = MagicMock()
+        register(endpoint="grpc://localhost:4317", auto_instrument=False)
+        mock_log.assert_not_called()
+        fresh_globals.assert_not_called()
+        assert "gRPC" in caplog.text
 
     @patch.object(_register_mod, "_create_log_exporter")
     @patch.object(_register_mod, "_create_http_exporter")
@@ -519,11 +577,94 @@ class TestRegisterLogs:
         )
         fresh_globals.assert_called_once()
 
+    @patch.object(_register_mod, "_create_log_exporter")
+    @patch.object(_register_mod, "_create_http_exporter")
+    def test_explicit_endpoint_without_traces_suffix_skips_logs(
+        self, mock_http, mock_log, fresh_globals, clean_otlp_env, caplog
+    ):
+        from opensearch_genai_observability_sdk_py.register import register
+
+        mock_http.return_value = MagicMock()
+        register(endpoint="http://my-collector:4318/ingest", auto_instrument=False)
+        mock_log.assert_not_called()
+        fresh_globals.assert_not_called()
+        assert "cannot derive an OTLP logs endpoint" in caplog.text
+
+    @patch.object(_register_mod, "_create_log_exporter")
+    @patch.object(_register_mod, "_create_http_exporter")
+    def test_explicit_endpoint_with_logs_endpoint(
+        self, mock_http, mock_log, fresh_globals, clean_otlp_env
+    ):
+        from opensearch_genai_observability_sdk_py.register import register
+
+        mock_http.return_value = MagicMock()
+        mock_log.return_value = _in_memory_log_exporter()
+        register(
+            endpoint="http://traces-host:4318/ingest",
+            logs_endpoint="http://logs-host:4318/v1/logs",
+            auto_instrument=False,
+        )
+        assert mock_log.call_args.kwargs["endpoint"] == "http://logs-host:4318/v1/logs"
+
+    @patch.object(_register_mod, "_create_log_exporter")
+    @patch.object(_register_mod, "_create_http_exporter")
+    def test_logs_env_endpoint(
+        self, mock_http, mock_log, fresh_globals, clean_otlp_env, monkeypatch
+    ):
+        from opensearch_genai_observability_sdk_py.register import register
+
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "http://t:4318/v1/traces")
+        monkeypatch.setenv("OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "http://l:4318/v1/logs")
+        mock_http.return_value = MagicMock()
+        mock_log.return_value = _in_memory_log_exporter()
+        register(auto_instrument=False)
+        mock_http.assert_called_once_with("http://t:4318/v1/traces", None)
+        assert mock_log.call_args.kwargs["endpoint"] == "http://l:4318/v1/logs"
+
+    def test_sigv4_logs_derived_from_traces_pipeline(self, fresh_globals, clean_otlp_env):
+        from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
+        from opensearch_genai_observability_sdk_py.register import register
+
+        span_exp = MagicMock(spec=AWSSigV4OTLPExporter)
+        span_exp.endpoint = "https://traces.osis.amazonaws.com/v1/traces"
+        span_exp.create_log_exporter.return_value = _in_memory_log_exporter()
+        register(exporter=span_exp, auto_instrument=False)
+        span_exp.create_log_exporter.assert_called_once_with(
+            endpoint="https://traces.osis.amazonaws.com/v1/logs"
+        )
+
+    def test_sigv4_logs_env(self, fresh_globals, clean_otlp_env, monkeypatch):
+        from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
+        from opensearch_genai_observability_sdk_py.register import register
+
+        monkeypatch.setenv(
+            "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT", "https://logs.osis.amazonaws.com/v1/logs"
+        )
+        span_exp = MagicMock(spec=AWSSigV4OTLPExporter)
+        span_exp.endpoint = "https://traces.osis.amazonaws.com/v1/traces"
+        span_exp.create_log_exporter.return_value = _in_memory_log_exporter()
+        register(exporter=span_exp, auto_instrument=False)
+        span_exp.create_log_exporter.assert_called_once_with(
+            endpoint="https://logs.osis.amazonaws.com/v1/logs"
+        )
+
+    def test_sigv4_not_derivable_skips_logs(self, fresh_globals, clean_otlp_env, caplog):
+        from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
+        from opensearch_genai_observability_sdk_py.register import register
+
+        span_exp = MagicMock(spec=AWSSigV4OTLPExporter)
+        span_exp.endpoint = "https://traces.osis.amazonaws.com/ingest"
+        register(exporter=span_exp, auto_instrument=False)
+        span_exp.create_log_exporter.assert_not_called()
+        fresh_globals.assert_not_called()
+        assert "logs_endpoint=" in caplog.text
+
     def test_sigv4_exporter_gets_sigv4_log_exporter(self, fresh_globals):
         from opensearch_genai_observability_sdk_py.exporters import AWSSigV4OTLPExporter
         from opensearch_genai_observability_sdk_py.register import register
 
         span_exp = MagicMock(spec=AWSSigV4OTLPExporter)
+        span_exp.endpoint = "https://traces.osis.amazonaws.com/v1/traces"
         span_exp.create_log_exporter.return_value = _in_memory_log_exporter()
         register(
             exporter=span_exp,

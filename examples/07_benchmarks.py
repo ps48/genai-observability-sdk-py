@@ -20,8 +20,6 @@ duration, and with record_io=True opensearch.test_case.input / .expected /
 .output), both parented to the agent run's root span. At the end it emits one
 opensearch.test_suite_run.result event with the run status and case counts.
 Data Prepper routes all three to the otel-v1-genai-evaluation-* index.
-Pass trace_structure=True to evaluate() to also get the previous
-"test_suite_run" / "test_case" spans.
 
 Usage:
     AGENT_VERSION=v1 python examples/07_benchmarks.py

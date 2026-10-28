@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
+from opensearch_genai_observability_sdk_py.score import EVALUATION_EVENT_NAME
+
 if TYPE_CHECKING:
     from opensearchpy import RequestsAWSV4SignerAuth
 
@@ -269,30 +271,14 @@ class OpenSearchTraceRetriever:
     def find_evaluated_trace_ids(self, trace_ids: list[str]) -> set[str]:
         """Return the subset of trace_ids that already have an evaluation result.
 
-        Checks both the evaluation index (``gen_ai.evaluation.result`` events,
-        matched on ``traceId`` or ``opensearch.evaluation.trace_id``) and the
-        span index (deprecated ``evaluation`` spans).
+        Looks for ``gen_ai.evaluation.result`` events in the evaluation index,
+        matched on ``traceId`` or ``opensearch.evaluation.trace_id``. Test case
+        and run events in the same index are not evaluation results and are
+        ignored.
         """
         if not trace_ids:
             return set()
-        evaluated = self._find_in_evaluation_index(trace_ids)
-        body = {
-            "size": 0,
-            "query": {
-                "bool": {
-                    "must": [
-                        {"terms": {"traceId": trace_ids}},
-                        {"term": {"attributes.gen_ai.operation.name": "evaluation"}},
-                    ],
-                }
-            },
-            "aggs": {"evaluated": {"terms": {"field": "traceId", "size": len(trace_ids)}}},
-        }
-        resp = self._client.search(index=self._index, body=body)
-        evaluated |= {
-            b["key"] for b in resp.get("aggregations", {}).get("evaluated", {}).get("buckets", [])
-        }
-        return evaluated
+        return self._find_in_evaluation_index(trace_ids)
 
     def _find_in_evaluation_index(self, trace_ids: list[str]) -> set[str]:
         """Trace ids with ``gen_ai.evaluation.result`` events in the evaluation index."""
@@ -301,6 +287,7 @@ class OpenSearchTraceRetriever:
             "size": 0,
             "query": {
                 "bool": {
+                    "filter": [{"term": {"eventName": EVALUATION_EVENT_NAME}}],
                     "should": [
                         {"terms": {"traceId": trace_ids}},
                         {"terms": {target_field: trace_ids}},

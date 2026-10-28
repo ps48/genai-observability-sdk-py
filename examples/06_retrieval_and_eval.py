@@ -7,7 +7,7 @@ as a concrete example but is commented out by default.
 Results are written back with score(), which emits a gen_ai.evaluation.result
 log event parented to the evaluated span. Data Prepper stores it in the
 otel-v1-genai-evaluation index; find_evaluated_trace_ids() checks that index
-(and deprecated evaluation spans) to skip traces that are already scored.
+to skip traces that are already scored.
 
 Prerequisites:
     pip install opensearch-genai-observability-sdk-py[opensearch]

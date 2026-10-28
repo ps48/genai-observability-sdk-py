@@ -106,6 +106,7 @@ provider.force_flush()
 #   event_name     = "gen_ai.evaluation.result"
 #   trace_id/span_id = the evaluated span
 #   scope          = relevance_judge 1.0.0   (SDK name/version if no evaluator)
+#   scope attrs    = opensearch.genai.sdk.name / opensearch.genai.sdk.version
 #   attributes:
 #     gen_ai.evaluation.name                 = "relevance"
 #     gen_ai.evaluation.score.value          = 0.95
@@ -116,7 +117,3 @@ provider.force_flush()
 #     opensearch.evaluation.evaluator.type   = "llm_judge"
 #     opensearch.evaluation.score.min / .max = 0.0 / 1.0
 #     opensearch.evaluation.score.direction  = "maximize"
-#
-# Deprecated: score(..., carrier="span") or OPENSEARCH_GENAI_EVAL_CARRIER=span
-# restores the old child "evaluation <name>" span (one release only);
-# carrier="both" emits both while you migrate dashboards and queries.

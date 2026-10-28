@@ -281,6 +281,14 @@ class TestAWSSigV4OTLPLogExporter:
         assert log_exporter._endpoint.startswith("https://logs-pipeline.")
         assert log_exporter.signing_session._region == "eu-west-1"
 
+    def test_create_log_exporter_requires_endpoint_when_not_derivable(self):
+        with self._mock_botocore():
+            span_exporter = AWSSigV4OTLPExporter(
+                endpoint="https://pipeline.us-east-1.osis.amazonaws.com/ingest", region=REGION
+            )
+            with pytest.raises(ValueError, match="Cannot derive an OTLP logs endpoint"):
+                span_exporter.create_log_exporter()
+
     def test_raises_if_no_credentials(self):
         with self._mock_botocore(credentials=None):
             with pytest.raises(RuntimeError, match="No AWS credentials found"):
