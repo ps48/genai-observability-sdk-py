@@ -1,0 +1,92 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# The OpenSearch Contributors require contributions made to
+# this file be licensed under the Apache-2.0 license or a
+# compatible open source license.
+
+name: "OpenSearch agent evaluation"
+description: >-
+  Run an evaluate() suite with the OpenSearch GenAI Observability SDK, send traces
+  and evaluation events to OTLP endpoints, link the run in OpenSearch Dashboards,
+  and optionally fail on a score regression.
+
+inputs:
+  suite:
+    description: "Suite callable: module:function or path/to/file.py:function. It must return the BenchmarkResult of evaluate()."
+    required: true
+  traces-endpoint:
+    description: "OTLP traces URL, for example https://<traces-pipeline>.<region>.osis.amazonaws.com/v1/traces"
+    required: false
+    default: ""
+  logs-endpoint:
+    description: "OTLP logs URL for evaluation events, for example https://<logs-pipeline>.<region>.osis.amazonaws.com/v1/logs"
+    required: false
+    default: ""
+  aws-region:
+    description: "AWS region. When set, requests are signed with SigV4 (credentials from the environment, for example aws-actions/configure-aws-credentials)."
+    required: false
+    default: ""
+  aws-service:
+    description: "SigV4 service name: osis (OpenSearch Ingestion) or es"
+    required: false
+    default: "osis"
+  service-name:
+    description: "service.name resource attribute for the run"
+    required: false
+    default: "agent-evals-ci"
+  dashboards-url:
+    description: "OpenSearch Dashboards base URL, used for the run link"
+    required: false
+    default: ""
+  fail-on-regression:
+    description: "Fail the job if an evaluator mean is below a minimum: evaluator=0.8, comma or newline separated"
+    required: false
+    default: ""
+  pass-threshold:
+    description: "A score counts as pass in the summary table when value >= this"
+    required: false
+    default: "0.5"
+  working-directory:
+    description: "Directory to run the suite from (added to sys.path)"
+    required: false
+    default: "."
+  install:
+    description: "pip requirement(s) to install before running, space separated"
+    required: false
+    default: "opensearch-genai-observability-sdk-py[aws]"
+
+outputs:
+  run-id:
+    description: "test.suite.run.id of the (first) run"
+    value: ${{ steps.run.outputs.run-id }}
+  run-url:
+    description: "Link to the run in OpenSearch Dashboards (when dashboards-url is set)"
+    value: ${{ steps.run.outputs.run-url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install the SDK
+      shell: bash
+      env:
+        EVAL_INSTALL: ${{ inputs.install }}
+      run: |
+        # shellcheck disable=SC2086 # word splitting is intended for multiple requirements
+        python -m pip install --disable-pip-version-check $EVAL_INSTALL
+
+    - name: Run evaluation suite
+      id: run
+      shell: bash
+      # Inputs are passed as environment variables, never interpolated into the script.
+      env:
+        EVAL_SUITE: ${{ inputs.suite }}
+        EVAL_TRACES_ENDPOINT: ${{ inputs.traces-endpoint }}
+        EVAL_LOGS_ENDPOINT: ${{ inputs.logs-endpoint }}
+        EVAL_AWS_REGION: ${{ inputs.aws-region }}
+        EVAL_AWS_SERVICE: ${{ inputs.aws-service }}
+        EVAL_SERVICE_NAME: ${{ inputs.service-name }}
+        EVAL_DASHBOARDS_URL: ${{ inputs.dashboards-url }}
+        EVAL_FAIL_ON_REGRESSION: ${{ inputs.fail-on-regression }}
+        EVAL_PASS_THRESHOLD: ${{ inputs.pass-threshold }}
+        EVAL_WORKING_DIRECTORY: ${{ inputs.working-directory }}
+      run: python "$GITHUB_ACTION_PATH/run_suite.py"

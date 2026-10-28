@@ -643,6 +643,7 @@ See the [`examples/`](examples/) directory:
 | [`06_retrieval_and_eval.py`](examples/06_retrieval_and_eval.py) | Retrieve traces from OpenSearch, evaluate, write scores back |
 | [`07_benchmarks.py`](examples/07_benchmarks.py) | `evaluate()` with scorers, compare agent versions |
 | [`08_upload_benchmark_results.py`](examples/08_upload_benchmark_results.py) | `Benchmark.log()` — upload results from RAGAS, DeepEval, custom, with trace links |
+| [`github-action/`](examples/github-action/) | Reusable GitHub Action: run an `evaluate()` suite in CI, link the run in OpenSearch Dashboards, fail on score regressions |
 
 ## License
 
