@@ -20,6 +20,7 @@ from opensearch_genai_observability_sdk_py.benchmark import (
     EvalScore,
     _make_case_id,
     evaluate,
+    scorer,
 )
 
 # ---------------------------------------------------------------------------
@@ -853,3 +854,214 @@ class TestBenchmarkEvents:
         with Benchmark(name="b-bad-status") as b:
             with pytest.raises(ValueError, match="status must be one of"):
                 b.log(input="q1", status="skipped")
+
+
+# ---------------------------------------------------------------------------
+# Declared scorer rules and verdicts
+# ---------------------------------------------------------------------------
+
+ASSESSMENT = "opensearch.evaluation.assessment"
+THRESHOLD = "opensearch.evaluation.score.threshold"
+
+
+def _grades(events):
+    return {r.log_record.attributes["gen_ai.evaluation.name"]: r for r in events(EVALUATION)}
+
+
+class TestScorerDecorator:
+    def test_bare_decorator_keeps_function(self):
+        @scorer
+        def exact(i, o, e):
+            return 1.0
+
+        assert exact.__name__ == "exact"
+        assert exact("q", "a", None) == 1.0
+        assert exact.scorer_spec.name is None
+
+    def test_threshold_defaults_direction_maximize(self):
+        @scorer(threshold=4)
+        def q(i, o, e):
+            return 4.0
+
+        assert q.scorer_spec.direction == "maximize"
+
+    def test_invalid_direction_raises(self):
+        with pytest.raises(ValueError):
+            scorer(direction="up")
+
+    def test_invalid_evaluator_type_raises(self):
+        with pytest.raises(ValueError):
+            scorer(evaluator_type="robot")
+
+    def test_non_numeric_threshold_raises(self):
+        with pytest.raises(TypeError):
+            scorer(threshold="4")
+
+    def test_float_result_uses_declared_name_and_rule(self, events):
+        @scorer(
+            name="answer_quality",
+            threshold=4,
+            score_min=1,
+            score_max=5,
+            evaluator="quality_judge",
+            evaluator_type="llm_judge",
+        )
+        def quality(i, o, e):
+            return 3.0
+
+        result = evaluate(name="decl", task=lambda x: x, data=[{"input": "q"}], scores=[quality])
+        rec = _grades(events)["answer_quality"]
+        a = rec.log_record.attributes
+        assert a["gen_ai.evaluation.score.value"] == 3.0
+        assert a[THRESHOLD] == 4.0
+        assert a["opensearch.evaluation.score.direction"] == "maximize"
+        assert a["opensearch.evaluation.score.min"] == 1.0
+        assert a["opensearch.evaluation.score.max"] == 5.0
+        assert a["opensearch.evaluation.evaluator.name"] == "quality_judge"
+        assert a["opensearch.evaluation.evaluator.type"] == "llm_judge"
+        assert a[ASSESSMENT] == "fail"
+        assert rec.instrumentation_scope.name == "quality_judge"
+        assert result.cases[0].scores == {"answer_quality": 3.0}
+        assert result.cases[0].assessments == {"answer_quality": "fail"}
+
+    def test_eval_score_fields_override_declaration(self, events):
+        @scorer(name="latency_budget", direction="minimize", threshold=12)
+        def latency(i, o, e):
+            return EvalScore(name="latency_budget", value=13.0, threshold=15)
+
+        evaluate(name="override", task=lambda x: x, data=[{"input": "q"}], scores=[latency])
+        a = _grades(events)["latency_budget"].log_record.attributes
+        assert a[THRESHOLD] == 15.0
+        assert a["opensearch.evaluation.score.direction"] == "minimize"
+        assert a[ASSESSMENT] == "pass"
+
+    def test_passed_and_assessment_propagate(self, events):
+        def checks(i, o, e):
+            return [
+                EvalScore(name="a", value=0.5, passed=True),
+                EvalScore(name="b", value=0.5, assessment="fail"),
+                EvalScore(name="c", value=None, assessment="pass"),
+                EvalScore(name="d", value=0.5, assessment="pass", passed=False),
+            ]
+
+        result = evaluate(name="explicit", task=lambda x: x, data=[{"input": "q"}], scores=[checks])
+        grades = _grades(events)
+        assert grades["a"].log_record.attributes[ASSESSMENT] == "pass"
+        assert grades["b"].log_record.attributes[ASSESSMENT] == "fail"
+        assert grades["c"].log_record.attributes[ASSESSMENT] == "pass"
+        assert "gen_ai.evaluation.score.value" not in grades["c"].log_record.attributes
+        assert grades["d"].log_record.attributes[ASSESSMENT] == "pass"  # assessment wins
+        assert result.cases[0].scores == {"a": 0.5, "b": 0.5, "d": 0.5}
+
+    def test_bool_result_is_a_verdict(self, events):
+        @scorer(name="tool_selection")
+        def tools_ok(i, o, e):
+            return False
+
+        evaluate(name="bool", task=lambda x: x, data=[{"input": "q"}], scores=[tools_ok])
+        a = _grades(events)["tool_selection"].log_record.attributes
+        assert a["gen_ai.evaluation.score.value"] == 0.0
+        assert a[ASSESSMENT] == "fail"
+
+
+class TestCaseStatusFromVerdicts:
+    def test_no_rules_case_passes(self, events):
+        result = evaluate(
+            name="no-rules", task=lambda x: x, data=[{"input": "q"}], scores=[lambda i, o, e: 0.0]
+        )
+        assert result.cases[0].status == "pass"
+        assert result.cases[0].assessments is None
+        assert events(CASE_EVENT)[0].log_record.attributes["test.case.result.status"] == "pass"
+        assert ASSESSMENT not in events(EVALUATION)[0].log_record.attributes
+
+    def test_fail_verdict_fails_case(self, events):
+        @scorer(name="answer_quality", threshold=4)
+        def quality(i, o, e):
+            return 5.0 if i == "good" else 2.0
+
+        result = evaluate(
+            name="verdicts",
+            task=lambda x: x,
+            data=[{"input": "good", "case_id": "g"}, {"input": "bad", "case_id": "b"}],
+            scores=[quality],
+        )
+        assert [c.status for c in result.cases] == ["pass", "fail"]
+        by_case = {
+            r.log_record.attributes["test.case.id"]: r.log_record.attributes
+            for r in events(CASE_EVENT)
+        }
+        assert by_case["g"]["test.case.result.status"] == "pass"
+        assert by_case["b"]["test.case.result.status"] == "fail"
+        run = events(RUN_EVENT)[0].log_record.attributes
+        assert run["opensearch.test_suite_run.pass_count"] == 1
+        assert run["opensearch.test_suite_run.fail_count"] == 1
+        assert run["test.suite.run.status"] == "success"  # only errors fail the run
+
+    def test_error_beats_fail_verdict(self, events):
+        def bad(i, o, e):
+            raise RuntimeError("judge down")
+
+        evaluate(
+            name="err-first",
+            task=lambda x: x,
+            data=[{"input": "q"}],
+            scores=[lambda i, o, e: EvalScore(name="x", value=0.0, passed=False), bad],
+        )
+        assert events(CASE_EVENT)[0].log_record.attributes["test.case.result.status"] == "error"
+
+
+class TestScorerErrorGradeName:
+    def test_error_grade_uses_declared_name(self, events):
+        @scorer(name="answer_quality", threshold=4, score_min=1, score_max=5)
+        def quality(i, o, e):
+            raise RuntimeError("judge down")
+
+        evaluate(name="err-name", task=lambda x: x, data=[{"input": "q"}], scores=[quality])
+        grades = _grades(events)
+        assert list(grades) == ["answer_quality"]
+        a = grades["answer_quality"].log_record.attributes
+        assert a["error.type"] == "RuntimeError"
+        assert a[THRESHOLD] == 4.0
+        assert ASSESSMENT not in a
+        assert "gen_ai.evaluation.score.value" not in a
+        # The evaluator identity stays the function unless declared.
+        assert a["opensearch.evaluation.evaluator.name"] == "quality"
+
+    def test_error_grade_falls_back_to_function_name(self, events):
+        def quality(i, o, e):
+            raise RuntimeError("judge down")
+
+        evaluate(name="err-fn", task=lambda x: x, data=[{"input": "q"}], scores=[quality])
+        assert list(_grades(events)) == ["quality"]
+
+
+class TestBenchmarkVerdicts:
+    def test_eval_score_list_with_verdicts(self, events):
+        with Benchmark(name="bench-verdicts") as b:
+            b.log(
+                input="q",
+                case_id="c1",
+                scores=[
+                    EvalScore(
+                        name="answer_quality", value=3.0, threshold=4, score_min=1, score_max=5
+                    ),
+                    EvalScore(name="tool_selection", value=1.0, assessment="pass"),
+                ],
+            )
+        grades = _grades(events)
+        quality = grades["answer_quality"].log_record.attributes
+        assert quality[ASSESSMENT] == "fail"
+        assert quality["opensearch.evaluation.score.max"] == 5.0
+        assert grades["tool_selection"].log_record.attributes[ASSESSMENT] == "pass"
+        assert events(CASE_EVENT)[0].log_record.attributes["test.case.result.status"] == "fail"
+
+    def test_dict_scores_unchanged(self, events):
+        with Benchmark(name="bench-dict") as b:
+            b.log(input="q", scores={"accuracy": 0.0})
+        assert events(CASE_EVENT)[0].log_record.attributes["test.case.result.status"] == "pass"
+        assert ASSESSMENT not in events(EVALUATION)[0].log_record.attributes
+
+    def test_explicit_status_wins(self, events):
+        with Benchmark(name="bench-status") as b:
+            b.log(input="q", scores=[EvalScore(name="x", value=0.0, passed=False)], status="pass")
+        assert events(CASE_EVENT)[0].log_record.attributes["test.case.result.status"] == "pass"

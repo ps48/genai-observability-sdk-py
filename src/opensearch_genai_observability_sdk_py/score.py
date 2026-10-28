@@ -32,6 +32,12 @@ The instrumentation scope of every event is the evaluator identity
 evaluator is named. The scope also carries the attributes
 ``opensearch.genai.sdk.name`` / ``opensearch.genai.sdk.version``. Data
 Prepper and OpenSearch Dashboards derive the grade source from the scope.
+
+Verdicts: readers show pass/fail only for a declared rule, otherwise the
+result is neutral ("Scored"). Declare it with ``assessment`` (explicit
+``pass`` / ``fail``) or ``threshold`` (+ ``direction``). With a value and a
+threshold but no assessment, the SDK computes the assessment and records it
+too (see ``resolve_assessment``).
 """
 
 from __future__ import annotations
@@ -63,6 +69,7 @@ _TRUNCATION_MARKER = "...[truncated]"
 _VALID_LEVELS = ("span", "trace", "session", "tool_call")
 _VALID_EVALUATOR_TYPES = ("llm_judge", "code", "human", "external")
 _VALID_DIRECTIONS = ("maximize", "minimize")
+VALID_ASSESSMENTS = ("pass", "fail")
 
 
 def _no_span_context() -> Context:
@@ -95,6 +102,8 @@ def score(
     agent_name: str | None = None,
     error_type: str | None = None,
     judge_trace_id: str | None = None,
+    assessment: str | bool | None = None,
+    threshold: float | None = None,
 ) -> None:
     """Record an evaluation result as a ``gen_ai.evaluation.result`` event.
 
@@ -125,7 +134,15 @@ def score(
     - Extensions (until the upstream proposals merge):
       ``opensearch.evaluation.level``, ``.evaluator.name``,
       ``.evaluator.version``, ``.evaluator.type``, ``.score.direction``,
-      ``.score.min``, ``.score.max``, ``.judge.trace_id``, ``.trace_id``.
+      ``.score.min``, ``.score.max``, ``.score.threshold``, ``.assessment``,
+      ``.judge.trace_id``, ``.trace_id``.
+
+    Verdict: ``opensearch.evaluation.assessment`` is ``assessment`` when
+    given. Otherwise, when both ``value`` and ``threshold`` are given, it is
+    computed: ``pass`` if ``value >= threshold`` (``direction="maximize"``,
+    the default with a threshold) or ``value <= threshold``
+    (``direction="minimize"``), else ``fail``. With neither, no verdict is
+    recorded and readers show the result as neutral.
 
     Args:
         name: Evaluation metric name (e.g., ``"relevance"``, ``"factuality"``).
@@ -152,6 +169,10 @@ def score(
         agent_name: ``gen_ai.agent.name`` of the evaluated agent.
         error_type: ``error.type`` when the evaluator itself failed.
         judge_trace_id: Trace id of the judge's own run, if traced.
+        assessment: Explicit verdict, ``"pass"`` or ``"fail"`` (``True`` /
+            ``False`` are accepted). Other values are dropped with a warning.
+        threshold: Pass threshold (``opensearch.evaluation.score.threshold``).
+            ``direction`` defaults to ``"maximize"`` and is recorded.
 
     Examples:
         # Inline: score the active span
@@ -172,6 +193,12 @@ def score(
             score_max=1.0,
             direction="maximize",
         )
+
+        # Declared rule: 1-5 judge, pass at 4 or more (assessment computed)
+        score("answer_quality", 4.0, threshold=4, score_min=1, score_max=5)
+
+        # Explicit verdict from a code check
+        score("tool_selection", 1.0, assessment="pass", evaluator="tool_check")
 
         # Trace-level with benchmark grouping
         score(
@@ -211,6 +238,8 @@ def score(
         error_type=error_type,
         judge_trace_id=judge_trace_id,
         target_trace_id=target_trace_id,
+        assessment=assessment,
+        threshold=threshold,
         extra=attributes,
     )
     emit_evaluation_event(
@@ -246,12 +275,19 @@ def build_evaluation_attributes(
     error_type: str | None = None,
     judge_trace_id: str | None = None,
     target_trace_id: str | None = None,
+    assessment: str | bool | None = None,
+    threshold: float | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``gen_ai.evaluation.result`` attribute map (only set keys)."""
     _check_enum("level", level, _VALID_LEVELS)
     _check_enum("evaluator_type", evaluator_type, _VALID_EVALUATOR_TYPES)
     _check_enum("direction", direction, _VALID_DIRECTIONS)
+    if threshold is not None and direction is None:
+        direction = "maximize"
+    verdict = resolve_assessment(
+        value, assessment=assessment, threshold=threshold, direction=direction
+    )
 
     attrs: dict[str, Any] = {"gen_ai.evaluation.name": name}
     if value is not None:
@@ -282,6 +318,10 @@ def build_evaluation_attributes(
         attrs["opensearch.evaluation.score.min"] = float(score_min)
     if score_max is not None:
         attrs["opensearch.evaluation.score.max"] = float(score_max)
+    if threshold is not None:
+        attrs["opensearch.evaluation.score.threshold"] = float(threshold)
+    if verdict:
+        attrs["opensearch.evaluation.assessment"] = verdict
     if judge_trace_id:
         attrs["opensearch.evaluation.judge.trace_id"] = judge_trace_id
     if target_trace_id:
@@ -289,6 +329,51 @@ def build_evaluation_attributes(
     if extra:
         attrs.update(extra)
     return attrs
+
+
+def normalize_assessment(assessment: str | bool | None) -> str | None:
+    """Return ``"pass"`` / ``"fail"`` for a valid assessment, else ``None``.
+
+    Accepts ``"pass"`` / ``"fail"`` (any case, surrounding spaces ignored)
+    and ``True`` / ``False``. Other values are dropped with a warning.
+    """
+    if assessment is None:
+        return None
+    if isinstance(assessment, bool):
+        return "pass" if assessment else "fail"
+    if isinstance(assessment, str):
+        normalized = assessment.strip().lower()
+        if normalized in VALID_ASSESSMENTS:
+            return normalized
+    logger.warning(
+        "score(): assessment=%r is not one of %s; not recording it", assessment, VALID_ASSESSMENTS
+    )
+    return None
+
+
+def resolve_assessment(
+    value: float | None,
+    *,
+    assessment: str | bool | None = None,
+    threshold: float | None = None,
+    direction: str | None = None,
+) -> str | None:
+    """Resolve the verdict of one result: ``"pass"``, ``"fail"`` or ``None``.
+
+    1. A valid explicit ``assessment`` wins.
+    2. Else, with both ``value`` and ``threshold``: ``pass`` when
+       ``value >= threshold`` (``direction`` ``"maximize"``, the default) or
+       ``value <= threshold`` (``"minimize"``), else ``fail``.
+    3. Else ``None``: no declared rule, readers show the result as neutral.
+    """
+    explicit = normalize_assessment(assessment)
+    if explicit is not None:
+        return explicit
+    if value is None or threshold is None:
+        return None
+    if direction == "minimize":
+        return "pass" if float(value) <= float(threshold) else "fail"
+    return "pass" if float(value) >= float(threshold) else "fail"
 
 
 def emit_evaluation_event(

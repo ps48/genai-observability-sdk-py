@@ -71,6 +71,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import json
 import logging
@@ -96,9 +97,13 @@ from opensearch_genai_observability_sdk_py._internal import (
     validate_metadata_keys,
 )
 from opensearch_genai_observability_sdk_py.score import (
+    _VALID_DIRECTIONS,
+    _VALID_EVALUATOR_TYPES,
     _no_span_context,
     build_evaluation_attributes,
     emit_evaluation_event,
+    normalize_assessment,
+    resolve_assessment,
     span_context_for,
 )
 
@@ -122,14 +127,31 @@ _CASE_STATUSES = ("pass", "fail", "error")
 class EvalScore:
     """Result from a scorer function.
 
-    Returned by scorer callables passed to ``evaluate()``.
+    Returned by scorer callables passed to ``evaluate()`` (or passed to
+    ``Benchmark.log(scores=[...])``).
+
+    Verdict fields (all optional; unset fields fall back to the scorer's
+    ``@scorer(...)`` declaration):
+
+    - ``assessment`` (``"pass"`` / ``"fail"``) or ``passed`` (bool): explicit
+      verdict, recorded as ``opensearch.evaluation.assessment``.
+      ``assessment`` wins when both are set.
+    - ``threshold`` + ``direction``: rule the SDK applies to ``value`` when no
+      explicit verdict is given.
+    - ``score_min`` / ``score_max``: scale bounds.
     """
 
     name: str
-    value: float
+    value: float | None
     label: str | None = None
     explanation: str | None = None
     metadata: dict[str, Any] | None = None
+    assessment: str | None = None
+    passed: bool | None = None
+    threshold: float | None = None
+    direction: str | None = None
+    score_min: float | None = None
+    score_max: float | None = None
 
 
 @dataclasses.dataclass
@@ -141,6 +163,125 @@ class _FailedScore:
     label: str | None = None
     explanation: str | None = None
     metadata: dict[str, Any] | None = None
+    assessment: str | None = None
+    passed: bool | None = None
+    threshold: float | None = None
+    direction: str | None = None
+    score_min: float | None = None
+    score_max: float | None = None
+
+
+# ---------------------------------------------------------------------------
+# @scorer: declare a scorer's evaluation name and pass rule up front
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class ScorerSpec:
+    """What a scorer declares about the evaluation it produces.
+
+    Attached to the function by ``@scorer(...)`` as ``fn.scorer_spec``.
+    """
+
+    name: str | None = None
+    direction: str | None = None
+    threshold: float | None = None
+    score_min: float | None = None
+    score_max: float | None = None
+    evaluator: str | None = None
+    evaluator_type: str | None = None
+
+
+def scorer(
+    fn: Callable[..., Any] | None = None,
+    *,
+    name: str | None = None,
+    direction: str | None = None,
+    threshold: float | None = None,
+    score_min: float | None = None,
+    score_max: float | None = None,
+    evaluator: str | None = None,
+    evaluator_type: str | None = None,
+) -> Any:
+    """Declare a scorer's evaluation name and pass rule for ``evaluate()``.
+
+    Usable bare (``@scorer``) or with arguments::
+
+        @scorer(name="answer_quality", threshold=4, score_min=1, score_max=5,
+                evaluator_type="llm_judge")
+        def quality(input, output, expected):
+            return judge(...)  # float or EvalScore
+
+        @scorer(name="latency_budget", direction="minimize", threshold=12)
+        def latency(input, output, expected):
+            return seconds
+
+    - ``name``: ``gen_ai.evaluation.name`` of float results and of the error
+      grade emitted when the scorer raises (default: the function name).
+    - ``threshold`` / ``direction`` (default ``"maximize"`` with a threshold)
+      / ``score_min`` / ``score_max``: defaults for every score the scorer
+      returns; fields set on a returned ``EvalScore`` take precedence.
+    - ``evaluator``: evaluator identity (instrumentation scope and
+      ``opensearch.evaluation.evaluator.name``; default: the function name).
+    - ``evaluator_type``: ``llm_judge``, ``code``, ``human`` or ``external``.
+
+    Raises:
+        ValueError: ``direction`` or ``evaluator_type`` is not a known value.
+        TypeError: ``threshold`` / ``score_min`` / ``score_max`` is not a number.
+    """
+    if direction is not None and direction not in _VALID_DIRECTIONS:
+        raise ValueError(f"direction must be one of {_VALID_DIRECTIONS}; got {direction!r}")
+    if evaluator_type is not None and evaluator_type not in _VALID_EVALUATOR_TYPES:
+        raise ValueError(
+            f"evaluator_type must be one of {_VALID_EVALUATOR_TYPES}; got {evaluator_type!r}"
+        )
+    for arg, val in (("threshold", threshold), ("score_min", score_min), ("score_max", score_max)):
+        if val is not None and (isinstance(val, bool) or not isinstance(val, (int, float))):
+            raise TypeError(f"{arg} must be a number; got {val!r}")
+    spec = ScorerSpec(
+        name=name,
+        direction=direction or ("maximize" if threshold is not None else None),
+        threshold=threshold,
+        score_min=score_min,
+        score_max=score_max,
+        evaluator=evaluator,
+        evaluator_type=evaluator_type,
+    )
+
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            return func(*args, **kwargs)
+
+        wrapper.scorer_spec = spec  # type: ignore[attr-defined]
+        return wrapper
+
+    if fn is not None:
+        return decorate(fn)
+    return decorate
+
+
+def _verdict(s: EvalScore | _FailedScore) -> str | None:
+    """Verdict of a resolved score (explicit assessment / passed, else threshold)."""
+    explicit = normalize_assessment(s.assessment) if s.assessment is not None else None
+    if explicit is None and s.passed is not None:
+        explicit = normalize_assessment(bool(s.passed))
+    return resolve_assessment(
+        s.value, assessment=explicit, threshold=s.threshold, direction=s.direction
+    )
+
+
+def _apply_spec(s: EvalScore, spec: ScorerSpec | None) -> EvalScore:
+    """Fill the score's unset rule fields from the scorer declaration."""
+    if spec is None:
+        return s
+    return dataclasses.replace(
+        s,
+        threshold=s.threshold if s.threshold is not None else spec.threshold,
+        direction=s.direction or spec.direction,
+        score_min=s.score_min if s.score_min is not None else spec.score_min,
+        score_max=s.score_max if s.score_max is not None else spec.score_max,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +335,9 @@ class TestCaseResult:
     exception class name when the task or a scorer raised. ``trace_id`` /
     ``span_id`` (hex) identify the span the case and score events are
     parented to (the agent run's root span), or are ``None`` when the task
-    started no span.
+    started no span. ``assessments`` maps evaluation name to the declared
+    verdict (``pass`` / ``fail``) for scores that have one; a ``fail``
+    verdict makes ``status`` ``"fail"``.
     """
 
     case_id: str
@@ -210,6 +353,7 @@ class TestCaseResult:
     duration_ms: float | None = None
     trace_id: str | None = None
     span_id: str | None = None
+    assessments: dict[str, str] | None = None
 
 
 @dataclasses.dataclass
@@ -434,12 +578,13 @@ def _emit_scores(
     *,
     context: Context,
     evaluator: str | None = None,
+    evaluator_type: str | None = None,
     error_type: str | None = None,
 ) -> None:
     """Emit one ``gen_ai.evaluation.result`` event per score.
 
     Each event is parented to ``context`` (the evaluated span, or no span)
-    and carries the ``test.*`` grouping attributes.
+    and carries the ``test.*`` grouping attributes and the verdict.
     """
     has_span = trace.get_current_span(context).get_span_context().is_valid
     for s in scores:
@@ -453,10 +598,26 @@ def _emit_scores(
             explanation=s.explanation,
             level="span" if has_span else None,
             evaluator=evaluator,
+            evaluator_type=evaluator_type,
+            direction=s.direction,
+            score_min=s.score_min,
+            score_max=s.score_max,
+            threshold=s.threshold,
+            assessment=_verdict(s),
             error_type=error_type,
             extra=extra,
         )
         emit_evaluation_event(attrs, context=context, evaluator=evaluator)
+
+
+def _assessments(scores: Iterable[EvalScore | _FailedScore]) -> dict[str, str]:
+    """Evaluation name -> verdict, for the scores that declare one."""
+    out: dict[str, str] = {}
+    for s in scores:
+        verdict = _verdict(s)
+        if verdict is not None:
+            out[s.name] = verdict
+    return out
 
 
 def _safe_metadata(metadata: dict[str, Any], *, context: str = "") -> dict[str, Any]:
@@ -570,7 +731,7 @@ class Benchmark:
         input: Any = None,
         output: Any = None,
         expected: Any = None,
-        scores: dict[str, float] | None = None,
+        scores: dict[str, float] | list[EvalScore] | None = None,
         metadata: dict[str, Any] | None = None,
         error: str | None = None,
         case_id: str | None = None,
@@ -591,7 +752,9 @@ class Benchmark:
             input: Test case input data.
             output: Actual output from the agent/system.
             expected: Expected/ground-truth output.
-            scores: Pre-computed scores (name -> float).
+            scores: Pre-computed scores: ``{name: value}``, or a list of
+                ``EvalScore`` to declare verdicts (``assessment`` / ``passed``
+                or ``threshold`` + ``direction``) and scale bounds.
             metadata: Arbitrary case-level metadata. Keys reserved by the
                 SDK are filtered out with a warning.
             error: Error message. The case event status becomes ``"error"``
@@ -604,8 +767,9 @@ class Benchmark:
                 ``trace_id`` is provided. The case and score events are
                 parented to it.
             status: Explicit case status, ``"pass"``, ``"fail"`` or
-                ``"error"``. Defaults to ``"error"`` when ``error`` is given,
-                else ``"pass"``.
+                ``"error"``. Defaults to ``"error"`` when ``error`` or
+                ``error_type`` is given, else ``"fail"`` when any score has a
+                ``fail`` verdict, else ``"pass"``.
             error_type: ``error.type`` for an errored case (exception class
                 name or other low-cardinality error identifier).
             duration_ms: Case duration, recorded as
@@ -618,11 +782,19 @@ class Benchmark:
         if status is not None and status not in _CASE_STATUSES:
             raise ValueError(f"status must be one of {', '.join(_CASE_STATUSES)}; got {status!r}")
 
-        scores = scores or {}
+        if isinstance(scores, dict):
+            eval_scores = [EvalScore(name=n, value=v) for n, v in scores.items()]
+        else:
+            eval_scores = [s for s in (scores or []) if isinstance(s, EvalScore)]
+        score_values = {s.name: s.value for s in eval_scores if s.value is not None}
+        assessments = _assessments(eval_scores)
         resolved_case_id = case_id or _make_case_id(input)
 
-        event_status = status or ("error" if error or error_type else "pass")
-        result_status = status or ("fail" if error else "pass")
+        verdict_failed = "fail" in assessments.values()
+        event_status = status or (
+            "error" if error or error_type else ("fail" if verdict_failed else "pass")
+        )
+        result_status = status or ("fail" if error or verdict_failed else "pass")
 
         grouping = _grouping(self._name, self._run_id, resolved_case_id, case_name)
 
@@ -655,11 +827,7 @@ class Benchmark:
                     span_id,
                 )
 
-        _emit_scores(
-            grouping,
-            [EvalScore(name=n, value=v) for n, v in scores.items()],
-            context=event_ctx,
-        )
+        _emit_scores(grouping, eval_scores, context=event_ctx)
         _emit_case_event(
             grouping,
             status=event_status,
@@ -679,13 +847,14 @@ class Benchmark:
                 input=input,
                 output=output,
                 expected=expected,
-                scores=scores,
+                scores=score_values,
                 error=error,
                 status=result_status,
                 error_type=error_type,
                 duration_ms=duration_ms,
                 trace_id=ev_trace_id,
                 span_id=ev_span_id,
+                assessments=assessments or None,
             )
         )
 
@@ -755,7 +924,14 @@ def evaluate(
     A task that raises does not stop the run: its case event has status
     ``error`` and ``error.type`` = the exception class, and its scorers are
     skipped. A scorer that raises emits an evaluation event with
-    ``error.type`` and marks the case ``error``.
+    ``error.type``, named after the scorer's declared ``@scorer(name=...)``
+    (else the function name), and marks the case ``error``.
+
+    Case status (``test.case.result.status``): ``error`` if the task or a
+    scorer raised; else ``fail`` if any score has a ``fail`` verdict
+    (explicit ``assessment`` / ``passed``, or ``threshold`` + ``direction``
+    from the score or its ``@scorer`` declaration); else ``pass``. Scores
+    without a declared rule never fail a case.
 
     Args:
         name: Benchmark name (``test.suite.name``).
@@ -767,8 +943,11 @@ def evaluate(
             once (single-pass); generators are materialized into a list.
         scores: List of scorer callables. Each receives
             ``(input, output, expected)`` and returns an ``EvalScore``,
-            list of ``EvalScore``, or a plain float. Scorers run outside the
-            agent trace, so a traced LLM judge gets its own trace.
+            list of ``EvalScore``, a plain float, or a bool (a verdict:
+            value 1.0/0.0 with ``pass``/``fail``). Decorate with
+            ``@scorer(...)`` to declare the evaluation name and pass rule.
+            Scorers run outside the agent trace, so a traced LLM judge gets
+            its own trace.
         metadata: Run metadata added to the case and run events. Keys
             reserved by the SDK are filtered out with a warning.
         record_io: Record input/output/expected as
@@ -832,12 +1011,19 @@ def evaluate(
         # Run scorers; each scorer's results become gen_ai.evaluation.result
         # events (evaluator = scorer function name).
         case_scores: dict[str, float] = {}
+        case_assessments: dict[str, str] = {}
         scorer_errors: list[str] = []
         if error_msg is None:
             for scorer_fn in scores:
+                spec: ScorerSpec | None = getattr(scorer_fn, "scorer_spec", None)
                 scorer_name = getattr(scorer_fn, "__name__", str(scorer_fn))
+                # Evaluation name of float results and of the error grade.
+                eval_name = (spec.name if spec else None) or scorer_name
                 # Named scorers identify the evaluator; lambdas etc. do not.
-                evaluator = scorer_name if scorer_name.isidentifier() else None
+                evaluator = (spec.evaluator if spec else None) or (
+                    scorer_name if scorer_name.isidentifier() else None
+                )
+                evaluator_type = spec.evaluator_type if spec else None
                 try:
                     result = scorer_fn(input_val, output_val, expected_val)
                 except Exception as exc:
@@ -850,12 +1036,20 @@ def evaluate(
                         case_id,
                         exc,
                     )
-                    # Record the evaluator failure (error.type, no score value).
+                    # Record the evaluator failure (error.type, no score value),
+                    # under the evaluation name the scorer would have produced.
+                    failed = _FailedScore(name=eval_name, explanation=str(exc))
+                    if spec is not None:
+                        failed.direction = spec.direction
+                        failed.threshold = spec.threshold
+                        failed.score_min = spec.score_min
+                        failed.score_max = spec.score_max
                     _emit_scores(
                         grouping,
-                        [_FailedScore(name=scorer_name, explanation=str(exc))],
+                        [failed],
                         context=event_ctx,
                         evaluator=evaluator,
+                        evaluator_type=evaluator_type,
                         error_type=type(exc).__qualname__,
                     )
                     continue
@@ -865,22 +1059,30 @@ def evaluate(
                     produced.append(result)
                 elif isinstance(result, list):
                     produced.extend(s for s in result if isinstance(s, EvalScore))
+                elif isinstance(result, bool):
+                    produced.append(EvalScore(name=eval_name, value=float(result), passed=result))
                 elif isinstance(result, (int, float)):
-                    produced.append(EvalScore(name=scorer_name, value=float(result)))
+                    produced.append(EvalScore(name=eval_name, value=float(result)))
+                produced = [_apply_spec(s, spec) for s in produced]
                 for s in produced:
-                    case_scores[s.name] = s.value
+                    if s.value is not None:
+                        case_scores[s.name] = s.value
+                case_assessments.update(_assessments(produced))
                 _emit_scores(
                     grouping,
                     produced,
                     context=event_ctx,
                     evaluator=evaluator,
+                    evaluator_type=evaluator_type,
                 )
 
-        # TestCaseResult.status: fail on any task or scorer error.
-        # Event status: error on any task or scorer error.
+        # Case status: error on any task or scorer error (TestCaseResult.status
+        # "fail"), else fail when any score has a fail verdict (explicit
+        # assessment or threshold), else pass. No declared verdicts: pass.
         errored = error_msg is not None or bool(scorer_errors)
-        result_status = "fail" if errored else "pass"
-        event_status = "error" if errored else "pass"
+        verdict_failed = "fail" in case_assessments.values()
+        result_status = "fail" if errored or verdict_failed else "pass"
+        event_status = "error" if errored else ("fail" if verdict_failed else "pass")
         duration_ms = (time.monotonic() - case_start) * 1000
 
         _emit_case_event(
@@ -910,6 +1112,7 @@ def evaluate(
                 duration_ms=duration_ms,
                 trace_id=ev_trace_id,
                 span_id=ev_span_id,
+                assessments=case_assessments or None,
             )
         )
 

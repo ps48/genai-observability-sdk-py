@@ -294,6 +294,69 @@ class TestEventAttributes:
 
 
 # ---------------------------------------------------------------------------
+# Verdict: assessment and threshold
+# ---------------------------------------------------------------------------
+
+ASSESSMENT = "opensearch.evaluation.assessment"
+THRESHOLD = "opensearch.evaluation.score.threshold"
+DIRECTION = "opensearch.evaluation.score.direction"
+
+
+class TestVerdict:
+    def test_no_rule_no_verdict(self, eval_events):
+        score(name="relevance", value=0.9)
+        a = _one_event(eval_events).log_record.attributes
+        assert ASSESSMENT not in a
+        assert THRESHOLD not in a
+        assert DIRECTION not in a
+
+    def test_explicit_assessment(self, eval_events):
+        score(name="tool_selection", value=0.5, assessment="pass")
+        assert _one_event(eval_events).log_record.attributes[ASSESSMENT] == "pass"
+
+    def test_assessment_normalized(self, eval_events):
+        score(name="a", assessment=" FAIL ")
+        score(name="b", assessment=True)
+        values = [r.log_record.attributes[ASSESSMENT] for r in eval_events()]
+        assert values == ["fail", "pass"]
+
+    def test_invalid_assessment_dropped_with_warning(self, eval_events, caplog):
+        score(name="a", value=1.0, assessment="maybe")
+        assert ASSESSMENT not in _one_event(eval_events).log_record.attributes
+        assert "assessment" in caplog.text
+
+    def test_threshold_maximize_default(self, eval_events):
+        score(name="q", value=4.0, threshold=4)
+        score(name="q", value=3.0, threshold=4)
+        a, b = (r.log_record.attributes for r in eval_events())
+        assert a[THRESHOLD] == 4.0
+        assert isinstance(a[THRESHOLD], float)
+        assert a[DIRECTION] == "maximize"
+        assert a[ASSESSMENT] == "pass"
+        assert b[ASSESSMENT] == "fail"
+
+    def test_threshold_minimize(self, eval_events):
+        score(name="latency", value=12.0, threshold=12, direction="minimize")
+        score(name="latency", value=12.5, threshold=12, direction="minimize")
+        a, b = (r.log_record.attributes for r in eval_events())
+        assert a[DIRECTION] == "minimize"
+        assert a[ASSESSMENT] == "pass"
+        assert b[ASSESSMENT] == "fail"
+
+    def test_explicit_assessment_wins_over_threshold(self, eval_events):
+        score(name="q", value=1.0, threshold=4, assessment="pass")
+        a = _one_event(eval_events).log_record.attributes
+        assert a[ASSESSMENT] == "pass"
+        assert a[THRESHOLD] == 4.0
+
+    def test_threshold_without_value_no_verdict(self, eval_events):
+        score(name="q", threshold=4, error_type="TimeoutError")
+        a = _one_event(eval_events).log_record.attributes
+        assert a[THRESHOLD] == 4.0
+        assert ASSESSMENT not in a
+
+
+# ---------------------------------------------------------------------------
 # No span carrier
 # ---------------------------------------------------------------------------
 

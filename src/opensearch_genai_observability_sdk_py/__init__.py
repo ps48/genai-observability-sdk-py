@@ -18,9 +18,11 @@ from opensearch_genai_observability_sdk_py.benchmark import (
     BenchmarkResult,
     BenchmarkSummary,
     EvalScore,
+    ScorerSpec,
     ScoreSummary,
     TestCaseResult,
     evaluate,
+    scorer,
 )
 from opensearch_genai_observability_sdk_py.enrich import enrich, mark_agent_root
 from opensearch_genai_observability_sdk_py.exporters import (
@@ -46,6 +48,8 @@ __all__ = [
     "Benchmark",
     "evaluate",
     "EvalScore",
+    "scorer",
+    "ScorerSpec",
     "BenchmarkResult",
     "BenchmarkSummary",
     "ScoreSummary",
