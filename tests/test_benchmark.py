@@ -1222,18 +1222,25 @@ class TestExpectedOutput:
         assert a[EXPECTED] == '{"city":"Paris","n":1}'
         assert EXPECTED_TRUNCATED not in a
 
-    def test_truncated_at_4096(self, events):
+    def test_truncated_at_32768(self, events):
         with Benchmark(name="exp-long") as b:
-            b.log(input="q", expected="x" * 5000, scores={"a": 1.0})
+            b.log(input="q", expected="x" * 40000, scores={"a": 1.0})
         a = events(EVALUATION)[0].log_record.attributes
-        assert a[EXPECTED] == "x" * 4096
+        assert a[EXPECTED] == "x" * 32768
         assert a[EXPECTED_TRUNCATED] is True
 
-    def test_exactly_4096_not_truncated(self, events):
+    def test_exactly_32768_not_truncated(self, events):
         with Benchmark(name="exp-edge") as b:
-            b.log(input="q", expected="y" * 4096, scores={"a": 1.0})
+            b.log(input="q", expected="y" * 32768, scores={"a": 1.0})
         a = events(EVALUATION)[0].log_record.attributes
-        assert a[EXPECTED] == "y" * 4096
+        assert a[EXPECTED] == "y" * 32768
+        assert EXPECTED_TRUNCATED not in a
+
+    def test_old_4096_cap_no_longer_truncates(self, events):
+        with Benchmark(name="exp-mid") as b:
+            b.log(input="q", expected="z" * 5000, scores={"a": 1.0})
+        a = events(EVALUATION)[0].log_record.attributes
+        assert a[EXPECTED] == "z" * 5000
         assert EXPECTED_TRUNCATED not in a
 
     def test_absent_when_no_expected(self, events):
@@ -1296,7 +1303,7 @@ class TestRecordExpected:
 
     def test_default_on(self, events):
         with Benchmark(name="rec-default") as b:
-            b.log(input="q", expected="x" * 5000, scores={"a": 1.0})
+            b.log(input="q", expected="x" * 40000, scores={"a": 1.0})
         evaluate(
             name="rec-default-eval",
             task=lambda x: x,
@@ -1309,14 +1316,14 @@ class TestRecordExpected:
 
     def test_benchmark_off_writes_neither(self, events):
         with Benchmark(name="rec-off", record_expected=False) as b:
-            b.log(input="q", expected="x" * 5000, scores={"a": 1.0, "b": 0.5})
+            b.log(input="q", expected="x" * 40000, scores={"a": 1.0, "b": 0.5})
             b.log(input="q2", expected="short", scores={"a": 1.0}, error_type="ValueError")
         records = events(EVALUATION)
         assert len(records) == 3
         for r in records:
             assert EXPECTED not in r.log_record.attributes
             assert EXPECTED_TRUNCATED not in r.log_record.attributes
-        assert b._cases[0].expected == "x" * 5000
+        assert b._cases[0].expected == "x" * 40000
 
     def test_evaluate_off_writes_neither(self, events):
         calls: list = []
@@ -1577,12 +1584,10 @@ class TestScorerJudgeContext:
         assert a["gen_ai.prompt.version"] == "v2"
         assert "gen_ai.system_instructions" not in a
 
-    def test_system_instructions_opt_in_and_truncated(self, events):
-        q = self._judge(judge_system_instructions="s" * 9000)
-        evaluate("s", task=lambda x: x, data=[{"input": "a"}], scores=[q])
-        a = events(EVALUATION)[0].log_record.attributes
-        assert len(a["gen_ai.system_instructions"]) == 8192
-        assert a["opensearch.gen_ai.evaluation.system_instructions_truncated"] is True
+    def test_no_system_instructions_argument(self):
+        # The full judge prompt goes on the judge's LLM span, not the events.
+        with pytest.raises(TypeError):
+            self._judge(judge_system_instructions="s")
 
     def test_judge_context_on_error_results(self, events):
         @scorer(name="q", judge_model="m1", description="d")

@@ -186,7 +186,6 @@ class ScorerSpec:
     judge_model: str | None = None
     judge_prompt_name: str | None = None
     judge_prompt_version: str | None = None
-    judge_system_instructions: str | None = None
 
     def judge_attributes(self) -> dict[str, Any]:
         """The evaluator description and judge context attributes it declares."""
@@ -195,7 +194,6 @@ class ScorerSpec:
             judge_model=self.judge_model,
             judge_prompt_name=self.judge_prompt_name,
             judge_prompt_version=self.judge_prompt_version,
-            judge_system_instructions=self.judge_system_instructions,
         )
 
 
@@ -213,7 +211,6 @@ def scorer(
     judge_model: str | None = None,
     judge_prompt_name: str | None = None,
     judge_prompt_version: str | None = None,
-    judge_system_instructions: str | None = None,
 ) -> Any:
     """Declare a scorer's evaluation name and pass rule for ``evaluate()``.
 
@@ -241,10 +238,10 @@ def scorer(
     - ``judge_model`` / ``judge_prompt_name`` / ``judge_prompt_version``: the
       LLM judge's model and prompt (``gen_ai.request.model``,
       ``gen_ai.prompt.name``, ``gen_ai.prompt.version``).
-    - ``judge_system_instructions``: the judge's system prompt
-      (``gen_ai.system_instructions``). Opt-in, as it may hold sensitive
-      data; cut to 8192 characters with
-      ``opensearch.gen_ai.evaluation.system_instructions_truncated`` set.
+    - The judge's full system prompt is not a scorer argument: it is never
+      put on result events. Record it on the judge's own LLM span as
+      ``gen_ai.system_instructions`` (the judge's instrumentation, or
+      ``enrich(system_instructions=...)`` inside an ``@observe`` judge call).
 
     All of these are set on every result the scorer produces, including its
     error results.
@@ -274,7 +271,6 @@ def scorer(
         judge_model=judge_model,
         judge_prompt_name=judge_prompt_name,
         judge_prompt_version=judge_prompt_version,
-        judge_system_instructions=judge_system_instructions,
     )
 
     def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
@@ -778,7 +774,7 @@ class Benchmark:
             output: Actual output from the agent/system (local result only).
             expected: Expected/ground-truth output. By default set on every
                 evaluation event of the case as ``opensearch.test.case.expected``
-                (non-strings JSON-encoded, cut to 4096 characters with
+                (non-strings JSON-encoded, cut to 32768 characters with
                 ``opensearch.test.case.expected_truncated`` set); not exported
                 when the Benchmark has ``record_expected=False``.
             scores: Pre-computed scores: ``{name: value}``, or a list of
@@ -1015,7 +1011,7 @@ def evaluate(
             ``"expected"`` is passed to the scorers and, by default, set on
             every evaluation event of the case as
             ``opensearch.test.case.expected`` (non-strings JSON-encoded, cut
-            to 4096 characters with ``opensearch.test.case.expected_truncated``
+            to 32768 characters with ``opensearch.test.case.expected_truncated``
             set). See ``record_expected``.
         scores: List of synchronous scorer callables. Each receives
             ``(input, output, expected)`` and returns an ``EvalScore``,

@@ -94,13 +94,9 @@ EVAL_EVALUATOR_DESCRIPTION_KEY = "opensearch.gen_ai.evaluation.evaluator.descrip
 JUDGE_MODEL_KEY = "gen_ai.request.model"
 JUDGE_PROMPT_NAME_KEY = "gen_ai.prompt.name"
 JUDGE_PROMPT_VERSION_KEY = "gen_ai.prompt.version"
-JUDGE_SYSTEM_INSTRUCTIONS_KEY = "gen_ai.system_instructions"
-EVAL_SYSTEM_INSTRUCTIONS_TRUNCATED_KEY = (
-    "opensearch.gen_ai.evaluation.system_instructions_truncated"
-)
-
-# Safety cap for the opt-in judge system instructions.
-SYSTEM_INSTRUCTIONS_MAX_CHARS = 8192
+# The judge's full system prompt is never put on a result event: it belongs on
+# the judge's own LLM span as gen_ai.system_instructions (OTel location),
+# recorded by the judge's instrumentation or enrich(system_instructions=...).
 
 _VALID_LEVELS = ("span", "trace", "session", "tool_call")
 _VALID_EVALUATOR_TYPES = ("llm_judge", "code", "human", "external")
@@ -158,7 +154,6 @@ def score(
     judge_model: str | None = None,
     judge_prompt_name: str | None = None,
     judge_prompt_version: str | None = None,
-    judge_system_instructions: str | None = None,
 ) -> None:
     """Record an evaluation result as a ``gen_ai.evaluation.result`` event.
 
@@ -192,7 +187,10 @@ def score(
       ``.score.min``, ``.score.max``, ``.score.threshold``,
       ``.judge.trace_id``, ``.evaluator.description``.
     - Judge context: ``gen_ai.request.model``, ``gen_ai.prompt.name``,
-      ``gen_ai.prompt.version`` and, opt-in only, ``gen_ai.system_instructions``.
+      ``gen_ai.prompt.version``. The judge's full system prompt is not put on
+      the event: record it on the judge's own LLM span as
+      ``gen_ai.system_instructions`` (the judge's instrumentation, or
+      ``enrich(system_instructions=...)`` inside an ``@observe`` judge call).
 
     Verdict: ``gen_ai.evaluation.score.label`` = ``pass`` / ``fail``. Pass it
     as ``label`` (any case; stored lowercase). Otherwise, when both ``value``
@@ -252,12 +250,8 @@ def score(
         judge_model: Model the LLM judge used (``gen_ai.request.model``).
         judge_prompt_name: Name of the judge prompt template (``gen_ai.prompt.name``).
         judge_prompt_version: Version of the judge prompt (``gen_ai.prompt.version``).
-        judge_system_instructions: The judge's system prompt
-            (``gen_ai.system_instructions``). Opt-in: it may hold sensitive
-            data, so it is recorded only when passed. Cut to
-            ``SYSTEM_INSTRUCTIONS_MAX_CHARS`` (8192) characters, with
-            ``opensearch.gen_ai.evaluation.system_instructions_truncated`` set
-            to ``true`` when cut.
+            Together with ``judge_prompt_name`` it identifies the prompt
+            (``name@version``); the full prompt text stays on the judge span.
 
     Examples:
         # Inline: score the active span
@@ -346,7 +340,6 @@ def score(
         judge_model=judge_model,
         judge_prompt_name=judge_prompt_name,
         judge_prompt_version=judge_prompt_version,
-        judge_system_instructions=judge_system_instructions,
         extra=(
             drop_reserved_keys(
                 attributes, reserved=_is_score_reserved_key, context=f"score({name!r})"
@@ -390,7 +383,6 @@ def build_evaluation_attributes(
     judge_model: str | None = None,
     judge_prompt_name: str | None = None,
     judge_prompt_version: str | None = None,
-    judge_system_instructions: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the ``gen_ai.evaluation.result`` attribute map (only set keys).
@@ -457,7 +449,6 @@ def build_evaluation_attributes(
             judge_model=judge_model,
             judge_prompt_name=judge_prompt_name,
             judge_prompt_version=judge_prompt_version,
-            judge_system_instructions=judge_system_instructions,
         )
     )
     return {**(extra or {}), **attrs}
@@ -469,13 +460,11 @@ def judge_context_attributes(
     judge_model: str | None = None,
     judge_prompt_name: str | None = None,
     judge_prompt_version: str | None = None,
-    judge_system_instructions: str | None = None,
 ) -> dict[str, Any]:
     """The evaluator description and judge context attributes (only set keys).
 
-    ``judge_system_instructions`` is cut to ``SYSTEM_INSTRUCTIONS_MAX_CHARS``
-    characters; when cut,
-    ``opensearch.gen_ai.evaluation.system_instructions_truncated`` is ``True``.
+    The judge's system prompt is not among them: it goes on the judge's own
+    LLM span as ``gen_ai.system_instructions``, never on a result event.
     """
     attrs: dict[str, Any] = {}
     if evaluator_description:
@@ -486,14 +475,6 @@ def judge_context_attributes(
         attrs[JUDGE_PROMPT_NAME_KEY] = judge_prompt_name
     if judge_prompt_version:
         attrs[JUDGE_PROMPT_VERSION_KEY] = judge_prompt_version
-    if judge_system_instructions:
-        if len(judge_system_instructions) > SYSTEM_INSTRUCTIONS_MAX_CHARS:
-            attrs[JUDGE_SYSTEM_INSTRUCTIONS_KEY] = judge_system_instructions[
-                :SYSTEM_INSTRUCTIONS_MAX_CHARS
-            ]
-            attrs[EVAL_SYSTEM_INSTRUCTIONS_TRUNCATED_KEY] = True
-        else:
-            attrs[JUDGE_SYSTEM_INSTRUCTIONS_KEY] = judge_system_instructions
     return attrs
 
 

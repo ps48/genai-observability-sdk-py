@@ -164,7 +164,7 @@ def get_event_logger() -> _logs.Logger:
 # case, set on every gen_ai.evaluation.result event of that case.
 TEST_CASE_EXPECTED_KEY = "opensearch.test.case.expected"
 TEST_CASE_EXPECTED_TRUNCATED_KEY = "opensearch.test.case.expected_truncated"
-EXPECTED_MAX_CHARS = 4096
+EXPECTED_MAX_CHARS = 32768
 
 # OpenSearch attributes (no OTel name yet) for a human-readable run name and
 # description, set on every gen_ai.evaluation.result event of the run.
@@ -191,7 +191,7 @@ def expected_attributes(expected: Any) -> dict[str, Any]:
 
     Strings are used as-is; other values are JSON-encoded (compact, non-ASCII
     kept, unknown types via ``str``). Values longer than
-    ``EXPECTED_MAX_CHARS`` (4096) characters are cut to that length and
+    ``EXPECTED_MAX_CHARS`` (32768) characters are cut to that length and
     ``opensearch.test.case.expected_truncated`` is set to ``True``. ``None``
     means no expected value: nothing is set.
     """
@@ -243,7 +243,9 @@ def parse_hex(value: str) -> int | None:
 # unset (for example the label of an error result).
 _EVALUATION_FIELD_PREFIXES = ("gen_ai.evaluation.", "opensearch.gen_ai.evaluation.")
 # The judge context keys (standard GenAI names) are set from score() /
-# @scorer arguments only.
+# @scorer arguments only. gen_ai.system_instructions is never set on a result
+# event (the judge's prompt belongs on the judge's own LLM span), so user
+# attributes cannot add it either.
 _EVALUATION_FIELD_KEYS = frozenset(
     {
         "error.type",

@@ -75,7 +75,7 @@ docker compose up -d
 curl -sk -u admin:"$OPENSEARCH_PASSWORD" 'https://localhost:9200/_cluster/health?pretty'
 ```
 
-Ports: OTel Collector `4318` (OTLP HTTP) and `4317` (gRPC), OpenSearch `9200`, Dashboards `5601`. Its Data Prepper routes spans to `otel-v1-apm-span-*`, logs to `logs-otel-v1-*`, and `gen_ai.evaluation.result` events to `otel-v1-genai-evaluation-*`. The admin password is `OPENSEARCH_PASSWORD` in the stack's `.env`.
+Ports: OTel Collector `4318` (OTLP HTTP) and `4317` (gRPC), OpenSearch `9200`, Dashboards `5601`. Its Data Prepper routes spans to `otel-v1-apm-span-*`, logs to `logs-otel-v1-*`, and `gen_ai.evaluation.result` events to the `otel-v1-genai-evaluation` index. The admin password is `OPENSEARCH_PASSWORD` in the stack's `.env`.
 
 In production nothing in the agent changes, only the endpoint and auth: see [8. Ship and monitor](#8-ship-and-monitor).
 
@@ -306,7 +306,7 @@ def answer_correctness(input, output, expected):
 
 ### answer_correctness (LLM judge)
 
-An LLM judge, with its context recorded on every result:
+An LLM judge, with its context recorded on every result. Results carry the prompt's name and version (`answer-quality@v1`); the full `JUDGE_PROMPT` goes on the judge's own LLM span as `gen_ai.system_instructions` (recorded by the judge's instrumentation, or `enrich(system_instructions=JUDGE_PROMPT)` inside an `@observe` judge call), never on the result:
 
 ```python
 JUDGE_PROMPT = """You grade answers of an observability assistant. Score 1 to 5:
@@ -324,7 +324,6 @@ Reply with JSON only: {"score": <1-5>, "reason": "<one sentence>"}"""
     judge_model="us.anthropic.claude-haiku-4-5-20251001-v1:0",
     judge_prompt_name="answer-quality",
     judge_prompt_version="v1",
-    judge_system_instructions=JUDGE_PROMPT,  # opt-in: recorded only when passed
 )
 def answer_quality(input, output, expected):
     verdict = judge(JUDGE_PROMPT, input, output.answer)
@@ -498,9 +497,10 @@ Write an offline evaluation for this agent with the OpenSearch GenAI observabili
   trajectory_match against a golden tool path.
 - One LLM-judge scorer (evaluator_type="llm_judge") for answer quality on a 1 to 5
   scale with threshold=4, using the agent's model provider. Pass description=,
-  judge_model=, judge_prompt_name=, judge_prompt_version= and
-  judge_system_instructions= to @scorer, and put the judge's reason in
-  EvalScore.explanation.
+  judge_model=, judge_prompt_name= and judge_prompt_version= to @scorer (bump the
+  version when the prompt text changes), and put the judge's reason in
+  EvalScore.explanation. Do not put the judge prompt on the result: it belongs on
+  the judge's LLM span (gen_ai.system_instructions).
 - Call evaluate(name=<suite>, task=<agent entry point>, data=cases, scores=[...],
   run_name=..., run_description=..., agent_name=..., agent_version=...).
 - Print the summary and the Dashboards link
@@ -533,14 +533,15 @@ Add an online evaluator for this agent with the OpenSearch GenAI observability S
 |---|---|---|
 | No spans in `otel-v1-apm-span-*` | The agent does not reach the collector, or `register()` is not called before the agent runs | Check the endpoint (`OTEL_EXPORTER_OTLP_ENDPOINT`, default `http://localhost:4318`) and the collector's `accepted` counters ([4](#4-verify-checkpoints)) |
 | Traces arrive, evaluation results do not | The logs endpoint or the logs pipeline is missing | Set a base `endpoint=`, or both `traces_endpoint=` and `logs_endpoint=`. With OSIS, create a separate logs pipeline |
-| Results land in `logs-otel-v1-*` | The Data Prepper route on `eventName` did not match | Route `/eventName == "gen_ai.evaluation.result"` to `otel-v1-genai-evaluation-*` ([Ingestion](agent-evaluations.md#ingestion)) |
+| Results land in `logs-otel-v1-*` | The Data Prepper route on `eventName` did not match | Route `/eventName == "gen_ai.evaluation.result"` to the `otel-v1-genai-evaluation` alias ([Ingestion](agent-evaluations.md#ingestion)) |
 | OSIS rejects or drops requests | Compression or transport mismatch | `compression=` must equal the pipeline's setting (`none` or `gzip`). OSIS is OTLP over HTTP only, with SigV4: no gRPC |
 | The online evaluator finds no traces | Wrong service name or window, or the root span has no `gen_ai.agent.name` | Check `register(service_name=)`, widen `--minutes`, and make the `@observe` agent span the root |
 | The online evaluator reads empty questions | The agent span has no GenAI messages | `enrich(input_messages=..., output_messages=...)` in the GenAI `parts` format ([3](#3-instrument-the-agent)) |
 | A run shows its id instead of a name | No run name | Pass `run_name=` to `evaluate()` or `Benchmark(...)` |
 | Compare shows cases as added and removed | `case_id` changed between runs | Keep `case_id` stable in the suite |
 | No pass / fail, only "Scored" | No declared rule | Return a `bool`, pass `threshold=`, or a `pass` / `fail` label |
-| Judge system instructions not searchable | String attributes longer than the template's `ignore_above` (1024 in the local stack) are stored but not indexed | Expected. They are still shown on the result |
+| A long expected output does not match a filter | String attributes longer than the template's `ignore_above` (256) are stored but not indexed | Expected. They are still shown on the result |
+| The judge prompt is not on the result | By design: results carry `gen_ai.prompt.name` / `.version` only | Open the judge trace (`judge_trace_id`); the prompt is on its LLM span as `gen_ai.system_instructions` |
 | Trace-based scorers see too few spans | Spans are batched and ingested a few seconds later | `trace.get_tracer_provider().force_flush()`, then poll until the span count is stable (the cookbook's `spans_of`) |
 | `zsh: no matches found` on a `curl` | Unquoted `?` in the URL | Quote the URL |
 

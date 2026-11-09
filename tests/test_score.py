@@ -17,7 +17,6 @@ from opensearch_genai_observability_sdk_py._internal import SDK_SCOPE_NAME, SDK_
 from opensearch_genai_observability_sdk_py._internal import parse_hex as _parse_hex
 from opensearch_genai_observability_sdk_py.score import (
     EXPLANATION_MAX_CHARS,
-    SYSTEM_INSTRUCTIONS_MAX_CHARS,
     score,
 )
 
@@ -544,7 +543,7 @@ class TestJudgeContext:
         assert a["gen_ai.request.model"] == "claude-haiku-4-5"
         assert a["gen_ai.prompt.name"] == "answer-quality"
         assert a["gen_ai.prompt.version"] == "v2"
-        # Opt-in only: never recorded unless passed.
+        # The judge's system prompt is never on a result event.
         assert "gen_ai.system_instructions" not in a
         assert "opensearch.gen_ai.evaluation.system_instructions_truncated" not in a
 
@@ -560,23 +559,35 @@ class TestJudgeContext:
         ):
             assert key not in a
 
-    def test_system_instructions_opt_in(self, eval_events):
-        score("accuracy", 1.0, judge_system_instructions="You are a strict grader.")
-        a = _one_event(eval_events).log_record.attributes
-        assert a["gen_ai.system_instructions"] == "You are a strict grader."
-        assert "opensearch.gen_ai.evaluation.system_instructions_truncated" not in a
+    def test_no_system_instructions_argument(self):
+        # The full judge prompt goes on the judge's LLM span, not the event.
+        with pytest.raises(TypeError):
+            score("accuracy", 1.0, judge_system_instructions="You are a strict grader.")  # type: ignore[call-arg]
 
-    def test_system_instructions_truncated(self, eval_events):
-        score("accuracy", 1.0, judge_system_instructions="x" * (SYSTEM_INSTRUCTIONS_MAX_CHARS + 5))
-        a = _one_event(eval_events).log_record.attributes
-        assert len(a["gen_ai.system_instructions"]) == SYSTEM_INSTRUCTIONS_MAX_CHARS
-        assert a["opensearch.gen_ai.evaluation.system_instructions_truncated"] is True
+    def test_system_instructions_on_judge_span_not_event(self, eval_events, exporter):
+        from opensearch_genai_observability_sdk_py import enrich, observe
 
-    def test_system_instructions_at_limit_not_truncated(self, eval_events):
-        score("accuracy", 1.0, judge_system_instructions="x" * SYSTEM_INSTRUCTIONS_MAX_CHARS)
+        @observe(name="judge")
+        def judge():
+            enrich(model="judge-model", system_instructions="You are a strict grader.")
+            return trace.get_current_span().get_span_context()
+
+        ctx = judge()
+        score(
+            "accuracy",
+            1.0,
+            trace_id=TRACE_ID,
+            judge_trace_id=format(ctx.trace_id, "032x"),
+            judge_prompt_name="strict-grader",
+            judge_prompt_version="v3",
+        )
         a = _one_event(eval_events).log_record.attributes
-        assert len(a["gen_ai.system_instructions"]) == SYSTEM_INSTRUCTIONS_MAX_CHARS
-        assert "opensearch.gen_ai.evaluation.system_instructions_truncated" not in a
+        assert a["gen_ai.prompt.name"] == "strict-grader"
+        assert a["gen_ai.prompt.version"] == "v3"
+        assert a["opensearch.gen_ai.evaluation.judge.trace_id"] == format(ctx.trace_id, "032x")
+        assert "gen_ai.system_instructions" not in a
+        (span,) = [s for s in exporter.get_finished_spans() if s.name == "judge"]
+        assert span.attributes["gen_ai.system_instructions"] == "You are a strict grader."
 
     def test_attributes_cannot_set_judge_keys(self, eval_events):
         score(
